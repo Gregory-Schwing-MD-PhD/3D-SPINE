@@ -1,0 +1,58 @@
+# ================================================================
+# SINGLE STAGE: TotalSpineSeg - Spine Segmentation Container
+# ================================================================
+FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+LABEL maintainer="go2432@wayne.edu"
+LABEL description="TotalSpineSeg - Vertebrae, IVD, Spinal Cord & Canal Segmentation"
+LABEL version="1.0"
+
+WORKDIR /app
+
+# 1. 🛑 SAFETY NET: Pin PyTorch versions so TotalSpineSeg doesn't overwrite them
+# TotalSpineSeg requires PyTorch < 2.6, so 2.3.1 is perfect.
+RUN echo "torch==2.3.1" > /tmp/constraints.txt && \
+    echo "torchvision==0.18.1" >> /tmp/constraints.txt && \
+    echo "numpy<2.0" >> /tmp/constraints.txt
+ENV PIP_CONSTRAINT=/tmp/constraints.txt
+
+# 2. Install System Dependencies
+# git: to clone the repo
+# libgl1/libglib2: for graphics/OpenCV dependencies
+# dcm2niix: for DICOM conversion if needed
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    dcm2niix \
+    && rm -rf /var/lib/apt/lists/*
+
+# 3. Clone TotalSpineSeg repo
+RUN git clone https://github.com/neuropoly/totalspineseg.git /app/totalspineseg_source
+
+# 4. Install TotalSpineSeg with nnU-Net extras
+# We install without the [nnunetv2] bracket first, then pin nnunetv2 explicitly
+# to avoid any transitive torch upgrades.
+WORKDIR /app/totalspineseg_source
+RUN pip install --no-cache-dir nnunetv2==2.6.2 && \
+    pip install --no-cache-dir -e .
+
+# 5. Cleanup source (keep it for editable install, but remove .git to save space)
+RUN rm -rf /app/totalspineseg_source/.git
+
+# 6. Setup Environment Variables
+# TOTALSPINESEG_DATA: where pre-trained model weights will be stored/downloaded
+ENV TOTALSPINESEG_DATA=/app/models \
+    PYTHONUNBUFFERED=1 \
+    PYTHONWARNINGS="ignore"
+
+# 7. Create standard working directories
+RUN mkdir -p /app/models /app/data /app/output
+
+# NOTE: Pre-trained weights are downloaded automatically on first run
+# from the GitHub releases. To pre-bake them into the image, you can
+# run `totalspineseg /app/data /app/output` once during build with a
+# dummy image, or manually copy weights into /app/models.
+
+WORKDIR /app
+
+CMD ["/bin/bash"]
