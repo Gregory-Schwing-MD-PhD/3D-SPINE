@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-MODE=${MODE:-prod}
+MODE=${MODE:-trial}
 
 echo "================================================================"
 echo "DICOM TO NIFTI CONVERSION"
