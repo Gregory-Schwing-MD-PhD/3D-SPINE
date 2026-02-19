@@ -46,13 +46,14 @@ SERIES_CSV="${PROJECT_DIR}/data/raw/train_series_descriptions.csv"
 OUTPUT_DIR="${PROJECT_DIR}/results/totalspineseg"
 MODELS_DIR="${PROJECT_DIR}/models/totalspineseg_models"
 
-mkdir -p logs "$OUTPUT_DIR" "$MODELS_DIR"
+# Writable overlay for nnunetv2 site-packages (trainer file copy needs write access)
+NNUNET_WRITABLE="${PROJECT_DIR}/models/nnunetv2_writable"
+
+mkdir -p logs "$OUTPUT_DIR" "$MODELS_DIR" "$NNUNET_WRITABLE"
 
 # --- Container ---
-# NOTE: Build this with: docker build -f Dockerfile.totalspineseg -t go2432/totalspineseg:latest .
 CONTAINER="docker://go2432/totalspineseg:latest"
 IMG_PATH="${NXF_SINGULARITY_CACHEDIR}/totalspineseg.sif"
-
 if [[ ! -f "$IMG_PATH" ]]; then
     echo "Pulling TotalSpineSeg container (first time only)..."
     singularity pull "$IMG_PATH" "$CONTAINER"
@@ -69,6 +70,7 @@ singularity exec --nv \
     --bind "${NIFTI_DIR}":/work/results/nifti \
     --bind "${OUTPUT_DIR}":/work/results/totalspineseg \
     --bind "${MODELS_DIR}":/app/models \
+    --bind "${NNUNET_WRITABLE}":/opt/conda/lib/python3.10/site-packages/nnunetv2/training/nnUNetTrainer \
     --env TOTALSPINESEG_DATA=/app/models \
     --pwd /work \
     "$IMG_PATH" \
