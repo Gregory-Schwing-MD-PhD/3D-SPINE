@@ -14,7 +14,7 @@
 set -euo pipefail
 
 echo "================================================================"
-echo "DOWNLOAD RSNA DATA + IAN PAN MODEL"
+echo "DOWNLOAD RSNA DATA"
 echo "Job ID: $SLURM_JOB_ID"
 echo "================================================================"
 
@@ -32,8 +32,7 @@ unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
 # --- Paths ---
 PROJECT_DIR="$(pwd)"
 DATA_DIR="${PROJECT_DIR}/data/raw"
-MODELS_DIR="${PROJECT_DIR}/models"
-mkdir -p "$DATA_DIR" "$MODELS_DIR" logs "${PROJECT_DIR}/.tmp_dl"
+mkdir -p "$DATA_DIR" logs "${PROJECT_DIR}/.tmp_dl"
 
 # --- Kaggle check ---
 KAGGLE_JSON="${HOME}/.kaggle/kaggle.json"
@@ -49,7 +48,7 @@ if [[ ! -f "$KAGGLE_JSON" ]]; then
 fi
 echo "✓ Kaggle credentials found"
 
-# --- Container (KEEP THE ORIGINAL) ---
+# --- Container ---
 CONTAINER="docker://go2432/spineps-preprocessing:latest"
 IMG_PATH="${NXF_SINGULARITY_CACHEDIR}/spineps-preprocessing.sif"
 if [[ ! -f "$IMG_PATH" ]]; then
@@ -64,7 +63,7 @@ chmod 600 ${PROJECT_DIR}/.kaggle_tmp/kaggle.json
 
 echo ""
 echo "================================================================"
-echo "STEP 1: Download Model Checkpoint + Validation IDs"
+echo "DOWNLOADING RSNA COMPETITION DATA"
 echo "================================================================"
 
 singularity exec \
@@ -75,46 +74,10 @@ singularity exec \
     bash -c "
         set -e
         cd .tmp_dl
-        
-        echo 'Downloading rsna2024-demo-workflow (Ian Pan checkpoint)...'
-        if [ ! -f rsna2024-demo-workflow.zip ]; then
-            kaggle datasets download -d hengck23/rsna2024-demo-workflow
-        else
-            echo '  Already downloaded, skipping.'
-        fi
-        
-        echo 'Extracting checkpoint and validation IDs...'
-        unzip -j -o rsna2024-demo-workflow.zip 00002484.pth valid_id.npy
-        
-        mv 00002484.pth /work/models/point_net_checkpoint.pth
-        mv valid_id.npy /work/models/valid_id.npy
-        
-        echo '✓ Model checkpoint: /work/models/point_net_checkpoint.pth'
-        echo '✓ Validation IDs: /work/models/valid_id.npy'
-    "
 
-if [[ ! -f "${MODELS_DIR}/point_net_checkpoint.pth" ]]; then
-    echo "ERROR: Model checkpoint not extracted"
-    exit 1
-fi
-
-echo ""
-echo "================================================================"
-echo "STEP 2: Download RSNA Competition Data"
-echo "================================================================"
-
-singularity exec \
-    --bind $PROJECT_DIR:/work \
-    --bind ${PROJECT_DIR}/.kaggle_tmp:/root/.kaggle \
-    --pwd /work \
-    "$IMG_PATH" \
-    bash -c "
-        set -e
-        cd .tmp_dl
-        
         echo 'Downloading train_series_descriptions.csv...'
         kaggle competitions download -c rsna-2024-lumbar-spine-degenerative-classification -f train_series_descriptions.csv
-        
+
         if [ -f 'train_series_descriptions.csv.zip' ]; then
             echo 'Unzipping CSV...'
             unzip -o train_series_descriptions.csv.zip
@@ -125,51 +88,50 @@ singularity exec \
             ls -lh
             exit 1
         fi
-        
+
         mv train_series_descriptions.csv /work/data/raw/
         echo '✓ Series CSV extracted'
-        
+
         echo ''
-        echo 'Downloading full competition zip (DICOM images)...'
+        echo 'Downloading full competition zip (ALL DICOM images)...'
         ZIP_FILE='rsna-2024-lumbar-spine-degenerative-classification.zip'
-        
+
         if [ ! -f \"\$ZIP_FILE\" ]; then
             kaggle competitions download -c rsna-2024-lumbar-spine-degenerative-classification
         else
             echo '  Zip already downloaded, skipping.'
         fi
-        
+
         echo ''
-        echo 'Extracting validation set studies only...'
+        echo 'Extracting ALL studies (no validation filter)...'
         python3 -c \"
-import zipfile, numpy as np, os
+import zipfile, os
 from pathlib import Path
 
-valid_ids = set(str(x) for x in np.load('/work/models/valid_id.npy'))
-print(f'Target: {len(valid_ids)} validation studies')
-
-# Check which studies already exist
 output_dir = Path('/work/data/raw/train_images')
 existing_studies = set(d.name for d in output_dir.iterdir() if d.is_dir()) if output_dir.exists() else set()
-studies_to_extract = valid_ids - existing_studies
 
-if not studies_to_extract:
-    print('✓ All studies already extracted, skipping.')
-else:
-    print(f'Already extracted: {len(existing_studies)}')
-    print(f'Extracting: {len(studies_to_extract)} new studies')
+print(f'Already extracted: {len(existing_studies)} studies')
+print('Extracting all train_images/ files...')
+
+with zipfile.ZipFile('\$ZIP_FILE', 'r') as z:
+    # Get all train_images files
+    to_extract = [f for f in z.namelist() if f.startswith('train_images/')]
     
-    with zipfile.ZipFile('\$ZIP_FILE', 'r') as z:
+    # Skip already extracted studies
+    if existing_studies:
         to_extract = [
-            f for f in z.namelist()
-            if f.startswith('train_images/') 
-            and len(f.split('/')) > 1 
-            and f.split('/')[1] in studies_to_extract
+            f for f in to_extract 
+            if len(f.split('/')) <= 1 or f.split('/')[1] not in existing_studies
         ]
-        print(f'Total files to extract: {len(to_extract)}')
-        z.extractall('/work/data/raw', members=to_extract)
     
-    print('✓ Extraction complete')
+    print(f'Total files to extract: {len(to_extract)}')
+    
+    if to_extract:
+        z.extractall('/work/data/raw', members=to_extract)
+        print('✓ Extraction complete')
+    else:
+        print('✓ All files already extracted')
 \"
     "
 
@@ -190,11 +152,6 @@ echo "VERIFICATION"
 echo "================================================================"
 
 echo ""
-echo "Model files:"
-ls -lh ${MODELS_DIR}/point_net_checkpoint.pth
-ls -lh ${MODELS_DIR}/valid_id.npy
-
-echo ""
 echo "Data files:"
 ls -lh ${DATA_DIR}/train_series_descriptions.csv
 N_STUDIES=$(ls ${DATA_DIR}/train_images/ | wc -l)
@@ -206,7 +163,6 @@ echo "DOWNLOAD COMPLETE"
 echo "================================================================"
 echo ""
 echo "Next steps:"
-echo "  1. Run SPINEPS:    sbatch slurm_scripts/02_spineps_segmentation.sh"
-echo "  2. Run inference:  sbatch slurm_scripts/03_centroid_inference.sh"
-echo "  3. View report:    sbatch slurm_scripts/04_generate_report.sh"
+echo "  1. Convert DICOM:  sbatch slurm_scripts/01_dicom_to_nifti.sh"
+echo "  2. Run pipeline:   sbatch slurm_scripts/00_run_all.sh"
 echo "================================================================"

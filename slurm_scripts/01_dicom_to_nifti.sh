@@ -4,10 +4,12 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
-#SBATCH --time=4:00:00
+#SBATCH --time=8:00:00
 #SBATCH --job-name=dicom_nifti
 #SBATCH -o logs/dicom_nifti_%j.out
 #SBATCH -e logs/dicom_nifti_%j.err
+#SBATCH --mail-user=go2432@wayne.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
 
 set -euo pipefail
 

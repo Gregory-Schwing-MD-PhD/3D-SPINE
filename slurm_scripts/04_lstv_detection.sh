@@ -8,6 +8,8 @@
 #SBATCH --job-name=lstv_detect
 #SBATCH -o logs/lstv_detect_%j.out
 #SBATCH -e logs/lstv_detect_%j.err
+#SBATCH --mail-user=go2432@wayne.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
 
 set -euo pipefail
 

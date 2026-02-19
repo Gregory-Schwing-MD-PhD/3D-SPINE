@@ -10,6 +10,8 @@
 #SBATCH --job-name=spineps
 #SBATCH -o logs/spineps_%j.out
 #SBATCH -e logs/spineps_%j.err
+#SBATCH --mail-user=go2432@wayne.edu
+#SBATCH --mail-type=BEGIN,END,FAIL
 
 set -euo pipefail
 
