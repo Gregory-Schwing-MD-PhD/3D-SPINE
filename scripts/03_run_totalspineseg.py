@@ -7,7 +7,7 @@ Uses series CSV to find the correct series per study.
 
 NIfTI layout expected (from 01_dicom_to_nifti.py):
   results/nifti/{study_id}/{series_id}/sub-{study_id}_acq-sag_T2w.nii.gz
-  results/nifti/{study_id}/{series_id}/sub-{study_id}_acq-axial_T2w.nii.gz
+  results/nifti/{study_id}/{series_id}/sub-{study_id}_acq-ax_T2w.nii.gz
 
 Usage:
     python 03_run_totalspineseg.py \
@@ -270,10 +270,18 @@ def main():
             if sag_series_id is None:
                 logger.warning("  ⚠ No sagittal T2w series in CSV")
             else:
+                # Look for sagittal NIfTI - may have _Eq_1 suffix from dcm2niix
                 nifti_path = study_dir / sag_series_id / f"sub-{study_id}_acq-sag_T2w.nii.gz"
                 if not nifti_path.exists():
-                    logger.warning(f"  ✗ Sagittal NIfTI not found: {nifti_path}")
-                else:
+                    # Try with _Eq_1 suffix
+                    nifti_path_eq = study_dir / sag_series_id / f"sub-{study_id}_acq-sag_T2w_Eq_1.nii.gz"
+                    if nifti_path_eq.exists():
+                        nifti_path = nifti_path_eq
+                    else:
+                        logger.warning(f"  ✗ Sagittal NIfTI not found: {nifti_path}")
+                        nifti_path = None
+                
+                if nifti_path:
                     logger.info(f"  Series (sag): {sag_series_id}")
                     sag_output = study_output_dir / f"{study_id}_sagittal_vertebrae.nii.gz"
                     result = run_totalseg(nifti_path, sag_output, study_id, 'sagittal')
