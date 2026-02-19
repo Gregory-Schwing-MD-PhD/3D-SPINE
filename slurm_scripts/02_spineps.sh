@@ -16,10 +16,14 @@
 set -euo pipefail
 
 MODE=${MODE:-prod}
+RETRY_FAILED=${RETRY_FAILED:-false}
 
 echo "================================================================"
 echo "SPINEPS SEGMENTATION"
 echo "Mode: $MODE"
+if [[ "$RETRY_FAILED" == "true" ]]; then
+    echo "Retry Failed: YES"
+fi
 echo "Job ID: $SLURM_JOB_ID | GPU: $CUDA_VISIBLE_DEVICES"
 echo "Start: $(date)"
 echo "================================================================"
@@ -56,6 +60,11 @@ if [[ ! -f "$IMG_PATH" ]]; then
 fi
 
 # --- Run ---
+RETRY_ARG=""
+if [[ "$RETRY_FAILED" == "true" ]]; then
+    RETRY_ARG="--retry-failed"
+fi
+
 singularity exec --nv \
     --bind "$PROJECT_DIR":/work \
     --bind "$NIFTI_DIR":/work/results/nifti \
@@ -69,7 +78,8 @@ singularity exec --nv \
     python /work/scripts/02_run_spineps.py \
         --nifti_dir /work/results/nifti \
         --output_dir /work/results/spineps \
-        --mode "$MODE"
+        --mode "$MODE" \
+        $RETRY_ARG
 
 echo "================================================================"
 echo "SPINEPS complete | End: $(date)"

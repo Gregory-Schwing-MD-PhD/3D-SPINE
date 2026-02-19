@@ -301,6 +301,10 @@ def main():
         study_id = study_dir.name
         logger.info(f"\n[{study_id}]")
         
+        # Create per-study NIfTI directory
+        study_nifti_dir = output_dir / study_id
+        study_nifti_dir.mkdir(parents=True, exist_ok=True)
+        
         conversions = {}
         
         try:
@@ -311,7 +315,7 @@ def main():
             
             if sag_series:
                 logger.info(f"  Sagittal T2: {sag_series.name}")
-                sag_output = output_dir / f"{study_id}_sag_t2.nii.gz"
+                sag_output = study_nifti_dir / "sag_t2.nii.gz"
                 sag_nifti = convert_dicom_to_nifti(
                     sag_series, sag_output, 'sag_t2'
                 )
@@ -330,7 +334,7 @@ def main():
             
             if axial_series:
                 logger.info(f"  Axial T2: {axial_series.name}")
-                axial_output = output_dir / f"{study_id}_axial_t2.nii.gz"
+                axial_output = study_nifti_dir / "axial_t2.nii.gz"
                 axial_nifti = convert_dicom_to_nifti(
                     axial_series, axial_output, 'axial_t2'
                 )
@@ -374,10 +378,13 @@ def main():
     logger.info(f"Failed:  {error_count}")
     logger.info(f"Total:   {success_count + error_count}")
     logger.info("")
-    logger.info("Outputs:")
-    logger.info(f"  • {output_dir}/*_sag_t2.nii.gz   - Sagittal T2")
-    logger.info(f"  • {output_dir}/*_axial_t2.nii.gz - Axial T2")
-    logger.info(f"  • {metadata_dir}/*_conversion.json")
+    logger.info("Directory structure:")
+    logger.info(f"  {output_dir}/")
+    logger.info("    ├── <study_id>/")
+    logger.info("    │   ├── sag_t2.nii.gz")
+    logger.info("    │   └── axial_t2.nii.gz")
+    logger.info("    └── metadata/")
+    logger.info("        └── <study_id>_conversion.json")
     logger.info("")
     logger.info("Next steps:")
     logger.info("  1. sbatch slurm_scripts/02_spineps.sh")
