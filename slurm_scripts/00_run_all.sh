@@ -22,6 +22,18 @@ echo "Job ID: $SLURM_JOB_ID"
 echo "Start: $(date)"
 echo "================================================================"
 
+# --- Environment ---
+export CONDA_PREFIX="${HOME}/mambaforge/envs/nextflow"
+export PATH="${CONDA_PREFIX}/bin:$PATH"
+unset JAVA_HOME
+
+export XDG_RUNTIME_DIR="${HOME}/xdr"
+export NXF_SINGULARITY_CACHEDIR="${HOME}/singularity_cache"
+mkdir -p $XDG_RUNTIME_DIR $NXF_SINGULARITY_CACHEDIR
+
+export NXF_SINGULARITY_HOME_MOUNT=true
+unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
+
 PROJECT_DIR="$(pwd)"
 cd "$PROJECT_DIR"
 
@@ -66,9 +78,9 @@ fi
 echo ""
 echo "Submitting: 01_dicom_to_nifti.sh"
 if [[ -n "$PREV_JOB" ]]; then
-    JOB1=$(sbatch --parsable --dependency=afterok:$PREV_JOB slurm_scripts/01_dicom_to_nifti.sh)
+    JOB1=$(MODE=$MODE sbatch --parsable --dependency=afterok:$PREV_JOB slurm_scripts/01_dicom_to_nifti.sh)
 else
-    JOB1=$(sbatch --parsable slurm_scripts/01_dicom_to_nifti.sh)
+    JOB1=$(MODE=$MODE sbatch --parsable slurm_scripts/01_dicom_to_nifti.sh)
 fi
 echo "  Job ID: $JOB1"
 JOBS+=("$JOB1")
@@ -76,14 +88,14 @@ JOBS+=("$JOB1")
 # Step 2: SPINEPS (depends on Step 1)
 echo ""
 echo "Submitting: 02_spineps.sh"
-JOB2=$(sbatch --parsable --dependency=afterok:$JOB1 slurm_scripts/02_spineps.sh)
+JOB2=$(MODE=$MODE sbatch --parsable --dependency=afterok:$JOB1 slurm_scripts/02_spineps.sh)
 echo "  Job ID: $JOB2 (GPU, after DICOM conversion)"
 JOBS+=("$JOB2")
 
 # Step 3: TotalSpineSeg (depends on Step 1, runs in parallel with SPINEPS)
 echo ""
 echo "Submitting: 03_totalspineseg.sh"
-JOB3=$(sbatch --parsable --dependency=afterok:$JOB1 slurm_scripts/03_totalspineseg.sh)
+JOB3=$(MODE=$MODE sbatch --parsable --dependency=afterok:$JOB1 slurm_scripts/03_totalspineseg.sh)
 echo "  Job ID: $JOB3 (GPU, parallel with SPINEPS)"
 JOBS+=("$JOB3")
 

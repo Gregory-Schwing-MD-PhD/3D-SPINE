@@ -22,23 +22,49 @@ echo "Job ID: $SLURM_JOB_ID"
 echo "Start: $(date)"
 echo "================================================================"
 
-# Environment
-module load dcm2niix || echo "dcm2niix not in modules, assuming in PATH"
+# --- Environment ---
+export CONDA_PREFIX="${HOME}/mambaforge/envs/nextflow"
+export PATH="${CONDA_PREFIX}/bin:$PATH"
+unset JAVA_HOME
 
-# Paths
+which singularity || echo "WARNING: singularity not found"
+
+export XDG_RUNTIME_DIR="${HOME}/xdr"
+export NXF_SINGULARITY_CACHEDIR="${HOME}/singularity_cache"
+mkdir -p $XDG_RUNTIME_DIR $NXF_SINGULARITY_CACHEDIR
+
+export NXF_SINGULARITY_HOME_MOUNT=true
+unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
+
+# --- Paths ---
 PROJECT_DIR="$(pwd)"
 DATA_DIR="${PROJECT_DIR}/data/raw/train_images"
 SERIES_CSV="${PROJECT_DIR}/data/raw/train_series_descriptions.csv"
 OUTPUT_DIR="${PROJECT_DIR}/results/nifti"
 
-mkdir -p logs "${OUTPUT_DIR}"
+mkdir -p logs "$OUTPUT_DIR"
 
-# Run
-python scripts/01_dicom_to_nifti.py \
-    --input_dir "${DATA_DIR}" \
-    --series_csv "${SERIES_CSV}" \
-    --output_dir "${OUTPUT_DIR}" \
-    --mode "${MODE}"
+# --- Container ---
+CONTAINER="docker://go2432/spineps-preprocessing:latest"
+IMG_PATH="${NXF_SINGULARITY_CACHEDIR}/spineps-preprocessing.sif"
+
+if [[ ! -f "$IMG_PATH" ]]; then
+    singularity pull "$IMG_PATH" "$CONTAINER"
+fi
+
+# --- Run ---
+singularity exec \
+    --bind "$PROJECT_DIR":/work \
+    --bind "$DATA_DIR":/data/input \
+    --bind "$OUTPUT_DIR":/data/output \
+    --bind "$(dirname $SERIES_CSV)":/data/raw \
+    --pwd /work \
+    "$IMG_PATH" \
+    python /work/scripts/01_dicom_to_nifti.py \
+        --input_dir  /data/input \
+        --series_csv /data/raw/train_series_descriptions.csv \
+        --output_dir /data/output \
+        --mode "$MODE"
 
 echo "================================================================"
 echo "Conversion complete | End: $(date)"

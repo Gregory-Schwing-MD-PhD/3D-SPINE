@@ -6,8 +6,8 @@
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:1
 #SBATCH --constraint=v100
-#SBATCH --time=24:00:00
-#SBATCH --job-name=spineps
+#SBATCH --time=36:00:00
+#SBATCH --job-name=spineps_run
 #SBATCH -o logs/spineps_%j.out
 #SBATCH -e logs/spineps_%j.err
 #SBATCH --mail-user=go2432@wayne.edu

@@ -6,7 +6,7 @@
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:1
 #SBATCH --constraint=v100
-#SBATCH --time=24:00:00
+#SBATCH --time=36:00:00
 #SBATCH --job-name=totalspineseg
 #SBATCH -o logs/totalspineseg_%j.out
 #SBATCH -e logs/totalspineseg_%j.err
@@ -16,7 +16,7 @@
 set -euo pipefail
 
 MODE=${MODE:-prod}
-SERIES=${SERIES:-both}  # sagittal, axial, or both
+SERIES=${SERIES:-both}
 
 echo "================================================================"
 echo "TOTALSPINESEG SEGMENTATION"
@@ -26,23 +26,47 @@ echo "Start: $(date)"
 echo "================================================================"
 
 # --- Environment ---
-# Load TotalSegmentator environment
-# Adjust this based on your setup
-conda activate totalsegmentator || source activate totalsegmentator
+export CONDA_PREFIX="${HOME}/mambaforge/envs/nextflow"
+export PATH="${CONDA_PREFIX}/bin:$PATH"
+unset JAVA_HOME
+
+which singularity || echo "WARNING: singularity not found"
+
+export XDG_RUNTIME_DIR="${HOME}/xdr"
+export NXF_SINGULARITY_CACHEDIR="${HOME}/singularity_cache"
+mkdir -p $XDG_RUNTIME_DIR $NXF_SINGULARITY_CACHEDIR
+
+export NXF_SINGULARITY_HOME_MOUNT=true
+unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
 
 # --- Paths ---
 PROJECT_DIR="$(pwd)"
 NIFTI_DIR="${PROJECT_DIR}/results/nifti"
 OUTPUT_DIR="${PROJECT_DIR}/results/totalspineseg"
 
-mkdir -p logs "${OUTPUT_DIR}"
+mkdir -p logs "$OUTPUT_DIR"
+
+# --- Container ---
+# TotalSegmentator container (adjust if you have a custom one)
+CONTAINER="docker://wasserth/totalsegmentator:latest"
+IMG_PATH="${NXF_SINGULARITY_CACHEDIR}/totalsegmentator.sif"
+
+if [[ ! -f "$IMG_PATH" ]]; then
+    singularity pull "$IMG_PATH" "$CONTAINER"
+fi
 
 # --- Run ---
-python scripts/03_run_totalspineseg.py \
-    --nifti_dir "${NIFTI_DIR}" \
-    --output_dir "${OUTPUT_DIR}" \
-    --series "${SERIES}" \
-    --mode "${MODE}"
+singularity exec --nv \
+    --bind "$PROJECT_DIR":/work \
+    --bind "$NIFTI_DIR":/data/nifti \
+    --bind "$OUTPUT_DIR":/data/output \
+    --pwd /work \
+    "$IMG_PATH" \
+    python /work/scripts/03_run_totalspineseg.py \
+        --nifti_dir  /data/nifti \
+        --output_dir /data/output \
+        --series "$SERIES" \
+        --mode "$MODE"
 
 echo "================================================================"
 echo "TotalSpineSeg complete | End: $(date)"
