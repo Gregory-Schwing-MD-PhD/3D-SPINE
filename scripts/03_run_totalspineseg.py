@@ -7,7 +7,7 @@ Uses series CSV to find the correct series per study.
 
 NIfTI layout expected (from 01_dicom_to_nifti.py):
   results/nifti/{study_id}/{series_id}/sub-{study_id}_acq-sag_T2w.nii.gz
-  results/nifti/{study_id}/{series_id}/sub-{study_id}_acq-ax_T2w.nii.gz
+  results/nifti/{study_id}/{series_id}/sub-{study_id}_acq-axial_T2w.nii.gz
 
 Usage:
     python 03_run_totalspineseg.py \
@@ -27,6 +27,7 @@ import pandas as pd
 import numpy as np
 from tqdm import tqdm
 import logging
+import traceback
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,7 +54,7 @@ AXIAL_T2_PATTERNS = [
 # SERIES SELECTION VIA CSV
 # ============================================================================
 
-def load_series_csv(csv_path: Path) -> pd.DataFrame | None:
+def load_series_csv(csv_path: Path) -> pd.DataFrame:
     try:
         df = pd.read_csv(csv_path)
         logger.info(f"Loaded {len(df)} rows from series CSV")
@@ -64,6 +65,9 @@ def load_series_csv(csv_path: Path) -> pd.DataFrame | None:
 
 
 def get_series_id(series_df: pd.DataFrame, study_id: str, patterns: list) -> str | None:
+    """Return series_id (str) matching one of the patterns, or None."""
+    if series_df is None:
+        return None
     try:
         study_rows = series_df[series_df['study_id'] == int(study_id)]
         for pattern in patterns:
@@ -81,13 +85,12 @@ def get_series_id(series_df: pd.DataFrame, study_id: str, patterns: list) -> str
 # TOTALSEGMENTATOR
 # ============================================================================
 
-def run_totalseg(nifti_path: Path, output_dir: Path, study_id: str, acq: str) -> Path | None:
+def run_totalseg(nifti_path: Path, output_path: Path, study_id: str, acq: str) -> Path | None:
     """
     Run TotalSegmentator on one NIfTI.
-    acq: 'sag' or 'ax'
-    Returns path to final segmentation file, or None on failure.
+    acq: 'sagittal' or 'axial'
     """
-    temp_dir = output_dir / f"temp_{study_id}_{acq}"
+    temp_dir = output_path.parent / f"temp_{study_id}_{acq}"
     temp_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -100,14 +103,17 @@ def run_totalseg(nifti_path: Path, output_dir: Path, study_id: str, acq: str) ->
             '--ml',
         ]
 
-        logger.info(f"  Running TotalSegmentator (acq-{acq})...")
+        logger.info(f"  Running TotalSegmentator ({acq})...")
+        sys.stdout.flush()
+        
         result = subprocess.run(
             cmd,
-            stdout=subprocess.PIPE,
+            stdout=None,
             stderr=subprocess.PIPE,
             text=True,
             timeout=600,
         )
+        sys.stdout.flush()
 
         if result.returncode != 0:
             logger.error(f"  TotalSegmentator failed:\n{result.stderr}")
@@ -115,19 +121,21 @@ def run_totalseg(nifti_path: Path, output_dir: Path, study_id: str, acq: str) ->
 
         seg_file = temp_dir / 'segmentations.nii.gz'
         if not seg_file.exists():
-            logger.error(f"  Output file not found: {seg_file}")
+            logger.error(f"  Output not found: {seg_file}")
             return None
 
-        final_path = output_dir / f"{study_id}_acq-{acq}_seg-total_msk.nii.gz"
-        shutil.move(str(seg_file), str(final_path))
-        logger.info(f"  ✓ Saved -> {final_path.name}")
-        return final_path
+        shutil.move(str(seg_file), str(output_path))
+        logger.info(f"  ✓ Saved: {output_path.name}")
+        return output_path
 
     except subprocess.TimeoutExpired:
         logger.error("  TotalSegmentator timed out (>600s)")
+        sys.stdout.flush()
         return None
     except Exception as e:
         logger.error(f"  Error: {e}")
+        logger.debug(traceback.format_exc())
+        sys.stdout.flush()
         return None
     finally:
         if temp_dir.exists():
@@ -138,7 +146,7 @@ def run_totalseg(nifti_path: Path, output_dir: Path, study_id: str, acq: str) ->
 # PROGRESS TRACKING
 # ============================================================================
 
-def load_progress(progress_file: Path) -> dict:
+def load_progress(progress_file):
     if progress_file.exists():
         try:
             with open(progress_file) as f:
@@ -150,7 +158,7 @@ def load_progress(progress_file: Path) -> dict:
     return {'processed': [], 'success': [], 'failed': []}
 
 
-def save_progress(progress_file: Path, progress: dict):
+def save_progress(progress_file, progress):
     try:
         tmp = progress_file.with_suffix('.json.tmp')
         with open(tmp, 'w') as f:
@@ -213,7 +221,8 @@ def main():
         else set(progress['processed'])
     )
 
-    study_dirs = sorted([d for d in nifti_dir.iterdir() if d.is_dir()])
+    # Study dirs are the top-level subdirs of nifti_dir
+    study_dirs = sorted([d for d in nifti_dir.iterdir() if d.is_dir() and d.name != 'metadata'])
 
     if args.valid_ids:
         try:
@@ -224,15 +233,14 @@ def main():
             logger.error(f"Failed to load valid_ids: {e}")
             return 1
 
-    # Filter already-processed BEFORE applying mode limits
-    study_dirs = [d for d in study_dirs if d.name not in skip_ids]
-
     if args.mode == 'debug':
         study_dirs = study_dirs[:1]
     elif args.mode == 'trial':
         study_dirs = study_dirs[:3]
     elif args.limit:
         study_dirs = study_dirs[:args.limit]
+
+    study_dirs = [d for d in study_dirs if d.name not in skip_ids]
 
     logger.info("=" * 70)
     logger.info("TOTALSPINESEG SEGMENTATION")
@@ -242,13 +250,16 @@ def main():
     logger.info(f"NIfTI dir:   {nifti_dir}")
     logger.info(f"Output:      {output_dir}")
     logger.info("=" * 70)
+    sys.stdout.flush()
 
     success_count = len(progress['success'])
     error_count   = len(progress['failed'])
 
-    for study_dir in tqdm(study_dirs, desc="Segmenting"):
+    for study_dir in tqdm(study_dirs, desc="Studies"):
         study_id = study_dir.name
         logger.info(f"\n[{study_id}]")
+        sys.stdout.flush()
+        
         study_output_dir = output_dir / study_id
         study_output_dir.mkdir(parents=True, exist_ok=True)
         any_success = False
@@ -261,9 +272,11 @@ def main():
             else:
                 nifti_path = study_dir / sag_series_id / f"sub-{study_id}_acq-sag_T2w.nii.gz"
                 if not nifti_path.exists():
-                    logger.warning(f"  ⚠ Sagittal NIfTI not found: {nifti_path}")
+                    logger.warning(f"  ✗ Sagittal NIfTI not found: {nifti_path}")
                 else:
-                    result = run_totalseg(nifti_path, study_output_dir, study_id, 'sag')
+                    logger.info(f"  Series (sag): {sag_series_id}")
+                    sag_output = study_output_dir / f"{study_id}_sagittal_vertebrae.nii.gz"
+                    result = run_totalseg(nifti_path, sag_output, study_id, 'sagittal')
                     if result:
                         any_success = True
 
@@ -272,11 +285,21 @@ def main():
             if ax_series_id is None:
                 logger.warning("  ⚠ No axial T2 series in CSV")
             else:
+                # Look for axial NIfTI - may have _Eq_1 suffix from dcm2niix
                 nifti_path = study_dir / ax_series_id / f"sub-{study_id}_acq-ax_T2w.nii.gz"
                 if not nifti_path.exists():
-                    logger.warning(f"  ⚠ Axial NIfTI not found: {nifti_path}")
-                else:
-                    result = run_totalseg(nifti_path, study_output_dir, study_id, 'ax')
+                    # Try with _Eq_1 suffix
+                    nifti_path_eq = study_dir / ax_series_id / f"sub-{study_id}_acq-ax_T2w_Eq_1.nii.gz"
+                    if nifti_path_eq.exists():
+                        nifti_path = nifti_path_eq
+                    else:
+                        logger.warning(f"  ✗ Axial NIfTI not found: {nifti_path}")
+                        nifti_path = None
+                
+                if nifti_path:
+                    logger.info(f"  Series (ax):  {ax_series_id}")
+                    ax_output = study_output_dir / f"{study_id}_axial_vertebrae.nii.gz"
+                    result = run_totalseg(nifti_path, ax_output, study_id, 'axial')
                     if result:
                         any_success = True
 
@@ -286,34 +309,43 @@ def main():
                 save_progress(progress_file, progress)
                 success_count += 1
                 logger.info("  ✓ Done")
+                sys.stdout.flush()
             else:
                 logger.warning("  ✗ No series segmented successfully")
                 mark_failed(progress, study_id)
                 save_progress(progress_file, progress)
                 error_count += 1
+                sys.stdout.flush()
 
         except KeyboardInterrupt:
             logger.warning("\n⚠ Interrupted — progress saved")
             save_progress(progress_file, progress)
+            sys.stdout.flush()
             break
         except Exception as e:
             logger.error(f"  ✗ Unexpected error: {e}")
-            import traceback
             logger.debug(traceback.format_exc())
             mark_failed(progress, study_id)
             save_progress(progress_file, progress)
             error_count += 1
+            sys.stdout.flush()
 
     logger.info("\n" + "=" * 70)
-    logger.info("TOTALSPINESEG COMPLETE")
+    logger.info("DONE")
     logger.info("=" * 70)
-    logger.info(f"Success: {success_count}")
-    logger.info(f"Failed:  {error_count}")
-    logger.info(f"Total:   {success_count + error_count}")
+    logger.info(f"Success:  {success_count}")
+    logger.info(f"Failed:   {error_count}")
+    logger.info(f"Total:    {success_count + error_count}")
     if progress['failed']:
         logger.info(f"Failed IDs: {progress['failed']}")
-    logger.info(f"\nOutputs: {output_dir}/{{study_id}}/{{study_id}}_acq-[sag|ax]_seg-total_msk.nii.gz")
+    logger.info(f"Progress: {progress_file}")
+    logger.info("")
+    logger.info("Outputs per study (under {study_id}/):")
+    logger.info("  • {study_id}_sagittal_vertebrae.nii.gz")
+    logger.info("  • {study_id}_axial_vertebrae.nii.gz")
+    logger.info("")
     logger.info("Next: sbatch slurm_scripts/04_detect_lstv.sh")
+    sys.stdout.flush()
 
     return 0 if error_count == 0 else 1
 
