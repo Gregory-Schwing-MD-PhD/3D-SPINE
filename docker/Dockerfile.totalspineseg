@@ -4,21 +4,31 @@
 FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
 LABEL maintainer="go2432@wayne.edu"
 LABEL description="TotalSpineSeg - Vertebrae, IVD, Spinal Cord & Canal Segmentation"
-LABEL version="1.0"
+LABEL version="1.7"
 
 WORKDIR /app
 
-# 1. 🛑 SAFETY NET: Pin PyTorch versions so TotalSpineSeg doesn't overwrite them
-# TotalSpineSeg requires PyTorch < 2.6, so 2.3.1 is perfect.
+# 1. Constraints: pin packages that must not be upgraded.
+#
+# IMPORTANT — no "+cu118" suffix on torch:
+#   The base image installs torch 2.3.1 via conda. Pip can see conda packages
+#   in this image and treats "torch 2.3.1" as already installed. If we write
+#   "torch==2.3.1+cu118", pip sees that as a DIFFERENT version (local version
+#   tags are part of the version identity), uninstalls the conda torch, and
+#   downloads the cu118 wheel from scratch — exactly the bloat we're avoiding.
+#   Using "torch==2.3.1" (no tag) matches what's already there, so pip marks
+#   it satisfied and skips the download entirely.
+#
+# nnunetv2==2.6.2: newer versions restructured the trainer module path:
+#   ModuleNotFoundError: No module named 'nnunetv2.training.nnUNetTrainer.nnUNetTrainer'
 RUN echo "torch==2.3.1" > /tmp/constraints.txt && \
     echo "torchvision==0.18.1" >> /tmp/constraints.txt && \
-    echo "numpy<2.0" >> /tmp/constraints.txt
+    echo "torchaudio==2.3.1" >> /tmp/constraints.txt && \
+    echo "numpy<2.0" >> /tmp/constraints.txt && \
+    echo "nnunetv2==2.6.2" >> /tmp/constraints.txt
 ENV PIP_CONSTRAINT=/tmp/constraints.txt
 
-# 2. Install System Dependencies
-# git: to clone the repo
-# libgl1/libglib2: for graphics/OpenCV dependencies
-# dcm2niix: for DICOM conversion if needed
+# 2. System deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     libgl1-mesa-glx \
@@ -26,33 +36,40 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     dcm2niix \
     && rm -rf /var/lib/apt/lists/*
 
-# 3. Clone TotalSpineSeg repo
-RUN git clone https://github.com/Gregory-Schwing-MD-PhD/totalspineseg.git /app/totalspineseg_source
+# 3. Clone TotalSpineSeg
+RUN git clone https://github.com/neuropoly/totalspineseg.git /app/totalspineseg_source
 
-# 4. Install TotalSpineSeg with nnU-Net extras
-# We install without the [nnunetv2] bracket first, then pin nnunetv2 explicitly
-# to avoid any transitive torch upgrades.
+# 4. Install TotalSpineSeg, then force nnunetv2==2.6.2 LAST.
+#    The constraints file ensures torch/torchvision/torchaudio are seen as
+#    already satisfied (conda install matches the pinned version), so pip
+#    skips re-downloading them when resolving totalspineseg's dep tree.
+#    --no-deps on force-reinstall: only swap nnunetv2 itself, do not
+#    re-resolve its deps (which would trigger another torch download).
 WORKDIR /app/totalspineseg_source
-RUN pip install --no-cache-dir nnunetv2==2.6.2 && \
-    pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir -e . && \
+    pip install --no-cache-dir --force-reinstall --no-deps nnunetv2==2.6.2
 
-# 5. Cleanup source (keep it for editable install, but remove .git to save space)
+# 5. Cleanup .git (keep source dir for editable install)
 RUN rm -rf /app/totalspineseg_source/.git
 
-# 6. Setup Environment Variables
-# TOTALSPINESEG_DATA: where pre-trained model weights will be stored/downloaded
+# 6. Build-time sanity check.
+#    Note: torch.cuda.is_available() is always False during docker build
+#    (no GPU passthrough at build time) — this is normal, not a broken install.
+RUN python -c "import torch; print('torch:', torch.__version__)" && \
+    pip show nnunetv2 | grep Version && \
+    python -c "\
+from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer; \
+print('nnUNetTrainer import: OK')" && \
+    python -c "\
+from totalspineseg import inference; \
+print('totalspineseg import: OK')"
+
+# 7. Environment
 ENV TOTALSPINESEG_DATA=/app/models \
     PYTHONUNBUFFERED=1 \
     PYTHONWARNINGS="ignore"
 
-# 7. Create standard working directories
 RUN mkdir -p /app/models /app/data /app/output
 
-# NOTE: Pre-trained weights are downloaded automatically on first run
-# from the GitHub releases. To pre-bake them into the image, you can
-# run `totalspineseg /app/data /app/output` once during build with a
-# dummy image, or manually copy weights into /app/models.
-
 WORKDIR /app
-
 CMD ["/bin/bash"]
