@@ -189,7 +189,8 @@ def run_spineps(nifti_path: Path, seg_dir: Path, study_id: str) -> dict:
             '-save_softmax_logits',
             '-override_semantic',
             '-override_instance',
-            '-override_ctd'
+            '-override_ctd',
+            '-ignore_inference_compatibility',   # <-- ADD THIS
         ]
         
         logger.info("  Running SPINEPS...")
