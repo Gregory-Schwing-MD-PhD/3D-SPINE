@@ -32,10 +32,23 @@ echo "================================================================"
 export CONDA_PREFIX="${HOME}/mambaforge/envs/nextflow"
 export PATH="${CONDA_PREFIX}/bin:$PATH"
 unset JAVA_HOME
+
 which singularity || echo "WARNING: singularity not found"
+
 export XDG_RUNTIME_DIR="${HOME}/xdr"
 export NXF_SINGULARITY_CACHEDIR="${HOME}/singularity_cache"
-mkdir -p $XDG_RUNTIME_DIR $NXF_SINGULARITY_CACHEDIR
+
+# Use /wsu/tmp for Singularity sandbox extraction — /tmp on compute nodes is too
+# small for the ~10GB torch/CUDA unpack. Unique subfolder per job avoids collisions.
+SCRATCH_DIR="/wsu/tmp/${USER}/totalspineseg_${SLURM_JOB_ID}"
+mkdir -p "$SCRATCH_DIR"
+export SINGULARITY_TMPDIR="$SCRATCH_DIR"
+
+mkdir -p "$XDG_RUNTIME_DIR" "$NXF_SINGULARITY_CACHEDIR"
+
+echo "Scratch dir: $SCRATCH_DIR"
+df -h "$SCRATCH_DIR"
+
 export NXF_SINGULARITY_HOME_MOUNT=true
 unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
 
@@ -46,14 +59,15 @@ SERIES_CSV="${PROJECT_DIR}/data/raw/train_series_descriptions.csv"
 OUTPUT_DIR="${PROJECT_DIR}/results/totalspineseg"
 MODELS_DIR="${PROJECT_DIR}/models/totalspineseg_models"
 
-# Writable overlay for nnunetv2 site-packages (trainer file copy needs write access)
-NNUNET_WRITABLE="${PROJECT_DIR}/models/nnunetv2_writable"
-
-mkdir -p logs "$OUTPUT_DIR" "$MODELS_DIR" "$NNUNET_WRITABLE"
+mkdir -p logs "$OUTPUT_DIR" "$MODELS_DIR"
 
 # --- Container ---
+# NOTE: Do NOT bind-mount anything over /opt/conda/lib/python3.10/site-packages/nnunetv2/
+# Doing so overwrites the installed Python packages inside the container and causes
+# ModuleNotFoundError for nnUNetTrainer and other nnunetv2 modules.
 CONTAINER="docker://go2432/totalspineseg:latest"
 IMG_PATH="${NXF_SINGULARITY_CACHEDIR}/totalspineseg.sif"
+
 if [[ ! -f "$IMG_PATH" ]]; then
     echo "Pulling TotalSpineSeg container (first time only)..."
     singularity pull "$IMG_PATH" "$CONTAINER"
@@ -70,7 +84,6 @@ singularity exec --nv \
     --bind "${NIFTI_DIR}":/work/results/nifti \
     --bind "${OUTPUT_DIR}":/work/results/totalspineseg \
     --bind "${MODELS_DIR}":/app/models \
-    --bind "${NNUNET_WRITABLE}":/opt/conda/lib/python3.10/site-packages/nnunetv2/training/nnUNetTrainer \
     --env TOTALSPINESEG_DATA=/app/models \
     --pwd /work \
     "$IMG_PATH" \
@@ -84,3 +97,7 @@ singularity exec --nv \
 echo "================================================================"
 echo "TotalSpineSeg complete | End: $(date)"
 echo "================================================================"
+
+# Cleanup scratch space so others can use it
+rm -rf "$SCRATCH_DIR"
+echo "Scratch cleanup complete."
