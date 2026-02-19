@@ -79,15 +79,16 @@ if [[ "$RETRY_FAILED" == "true" ]]; then
     RETRY_ARG="--retry-failed"
 fi
 
-singularity exec --nv \
+singularity exec --nv --writable-tmpfs \
     --bind "${PROJECT_DIR}":/work \
     --bind "${NIFTI_DIR}":/work/results/nifti \
     --bind "${OUTPUT_DIR}":/work/results/totalspineseg \
     --bind "${MODELS_DIR}":/app/models \
     --env TOTALSPINESEG_DATA=/app/models \
+    --env PYTHONUNBUFFERED=1 \
     --pwd /work \
     "$IMG_PATH" \
-    python3 /work/scripts/03_run_totalspineseg.py \
+    python3 -u /work/scripts/03_run_totalspineseg.py \
         --nifti_dir  /work/results/nifti \
         --series_csv /work/data/raw/train_series_descriptions.csv \
         --output_dir /work/results/totalspineseg \
