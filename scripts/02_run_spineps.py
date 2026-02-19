@@ -136,6 +136,26 @@ def compute_all_centroids(instance_mask_path, semantic_mask_path, ctd_path):
 # ============================================================================
 
 def compute_uncertainty_from_softmax(derivatives_dir, study_id, seg_dir):
+    """
+    Compute a voxel-wise uncertainty map from SPINEPS softmax logit outputs
+    and save it as a float32 NIfTI.
+
+    Method: Normalised Shannon Entropy
+    -----------------------------------
+    entropy(x) = -sum(p * log(p + eps), axis=-1)
+    uncertainty = entropy / log(num_classes)
+
+    This produces values in [0, 1] where:
+      0 = maximally confident (all probability mass on one class)
+      1 = maximally uncertain (uniform distribution across all classes)
+
+    This matches the uncertainty metric used in 03_run_totalspineseg.py, making
+    both maps directly comparable for downstream LSTV / Castellvi analysis.
+
+    SPINEPS softmax array layout: (H, W, D, C) — classes on the LAST axis.
+    TotalSpineSeg layout:         (C, H, W, D) — classes on the FIRST axis.
+    The entropy formula is identical; only the `axis` argument differs.
+    """
     if not HAS_NIBABEL:
         return False
     try:
@@ -143,8 +163,15 @@ def compute_uncertainty_from_softmax(derivatives_dir, study_id, seg_dir):
         if not logits_files:
             return False
 
+        # SPINEPS stores softmax as (H, W, D, C) — classes on axis=-1
         softmax = np.load(logits_files[0])['arr_0']
-        uncertainty = 1.0 - np.max(softmax, axis=-1)
+
+        # Normalised Shannon entropy — range [0, 1], float32
+        # 1e-8 epsilon prevents log(0) for zero-probability classes
+        epsilon     = 1e-8
+        entropy     = -np.sum(softmax * np.log(softmax + epsilon), axis=-1)
+        num_classes = softmax.shape[-1]
+        uncertainty = (entropy / np.log(num_classes)).astype(np.float32)
 
         semantic_mask = seg_dir / f"{study_id}_seg-spine_msk.nii.gz"
         if not semantic_mask.exists():
@@ -152,7 +179,7 @@ def compute_uncertainty_from_softmax(derivatives_dir, study_id, seg_dir):
 
         ref = nib.load(semantic_mask)
         nib.save(
-            nib.Nifti1Image(uncertainty.astype(np.float32), ref.affine, ref.header),
+            nib.Nifti1Image(uncertainty, ref.affine, ref.header),
             seg_dir / f"{study_id}_unc.nii.gz",
         )
         logger.info("  ✓ Uncertainty map saved")
@@ -467,7 +494,7 @@ def main():
     logger.info("  • {study_id}_seg-spine_msk.nii.gz  - Semantic mask")
     logger.info("  • {study_id}_seg-subreg_msk.nii.gz - Sub-region mask")
     logger.info("  • {study_id}_ctd.json              - Centroids (all structures)")
-    logger.info("  • {study_id}_unc.nii.gz            - Uncertainty map")
+    logger.info("  • {study_id}_unc.nii.gz            - Uncertainty map (normalised Shannon entropy, float32, [0,1])")
 
     return 0 if error_count == 0 else 1
 
