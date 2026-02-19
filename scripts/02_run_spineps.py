@@ -22,6 +22,7 @@ import numpy as np
 from scipy.ndimage import center_of_mass
 from tqdm import tqdm
 import logging
+import traceback
 
 try:
     import nibabel as nib
@@ -36,10 +37,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# ============================================================================
+# CENTROID COMPUTATION FOR ALL STRUCTURES
+# ============================================================================
+
+
 def compute_all_centroids(instance_mask_path: Path, semantic_mask_path: Path, 
                           ctd_path: Path) -> dict:
     """Compute centroids for ALL structures."""
     if not HAS_NIBABEL:
+        logger.warning("nibabel not available - skipping centroid computation")
         return {}
     
     try:
@@ -53,6 +60,7 @@ def compute_all_centroids(instance_mask_path: Path, semantic_mask_path: Path,
             ctd_data = json.load(f)
         
         if len(ctd_data) < 2:
+            logger.warning(f"Unexpected centroid JSON structure: {ctd_path}")
             return {}
         
         added_counts = {
@@ -60,9 +68,10 @@ def compute_all_centroids(instance_mask_path: Path, semantic_mask_path: Path,
         }
         
         # Instance mask (vertebrae, discs, endplates)
-        for label in np.unique(instance_data):
-            if label == 0:
-                continue
+        instance_labels = np.unique(instance_data)
+        instance_labels = instance_labels[instance_labels > 0]
+        
+        for label in instance_labels:
             label_str = str(label)
             if label_str in ctd_data[1]:
                 continue
@@ -82,9 +91,10 @@ def compute_all_centroids(instance_mask_path: Path, semantic_mask_path: Path,
                 added_counts['endplates'] += 1
         
         # Semantic mask (subregions)
-        for label in np.unique(semantic_data):
-            if label == 0:
-                continue
+        semantic_labels = np.unique(semantic_data)
+        semantic_labels = semantic_labels[semantic_labels > 0]
+        
+        for label in semantic_labels:
             label_str = str(label)
             if label_str in ctd_data[1]:
                 continue
@@ -104,7 +114,13 @@ def compute_all_centroids(instance_mask_path: Path, semantic_mask_path: Path,
     
     except Exception as e:
         logger.warning(f"Error computing centroids: {e}")
+        logger.debug(traceback.format_exc())
         return {}
+
+
+# ============================================================================
+# UNCERTAINTY MAP COMPUTATION
+# ============================================================================
 
 
 def compute_uncertainty_from_softmax(derivatives_dir: Path, study_id: str, 
@@ -139,11 +155,18 @@ def compute_uncertainty_from_softmax(derivatives_dir: Path, study_id: str,
         unc_path = seg_dir / f"{study_id}_unc.nii.gz"
         nib.save(unc_nii, unc_path)
         
+        logger.info(f"  ✓ Uncertainty map saved")
         return True
     
     except Exception as e:
-        logger.debug(f"Could not compute uncertainty: {e}")
+        logger.warning(f"Could not compute uncertainty map: {e}")
+        logger.debug(traceback.format_exc())
         return False
+
+
+# ============================================================================
+# SPINEPS EXECUTION
+# ============================================================================
 
 
 def run_spineps(nifti_path: Path, seg_dir: Path, study_id: str) -> dict:
@@ -169,14 +192,16 @@ def run_spineps(nifti_path: Path, seg_dir: Path, study_id: str) -> dict:
         ]
         
         logger.info("  Running SPINEPS...")
+        sys.stdout.flush()
         result = subprocess.run(
             cmd, 
-            stdout=subprocess.PIPE, 
+            stdout=None, 
             stderr=subprocess.PIPE, 
             text=True, 
             timeout=600, 
             env=env
         )
+        sys.stdout.flush()
         
         if result.returncode != 0:
             logger.error(f"  SPINEPS failed:\n{result.stderr}")
@@ -184,7 +209,7 @@ def run_spineps(nifti_path: Path, seg_dir: Path, study_id: str) -> dict:
         
         derivatives_base = nifti_path.parent / "derivatives_seg"
         if not derivatives_base.exists():
-            logger.error(f"  derivatives_seg not found")
+            logger.error(f"  derivatives_seg not found at: {derivatives_base}")
             return None
         
         def find_file(glob_pattern: str) -> Path:
@@ -199,7 +224,9 @@ def run_spineps(nifti_path: Path, seg_dir: Path, study_id: str) -> dict:
             dest = seg_dir / f"{study_id}_seg-vert_msk.nii.gz"
             shutil.copy(f, dest)
             outputs['instance_mask'] = dest
-            logger.info("  ✓ Instance mask")
+            logger.info("  ✓ Instance mask (seg-vert)")
+        else:
+            logger.warning("  ⚠ Instance mask not found")
         
         # Semantic mask
         f = find_file("*_seg-spine_msk.nii.gz")
@@ -207,7 +234,7 @@ def run_spineps(nifti_path: Path, seg_dir: Path, study_id: str) -> dict:
             dest = seg_dir / f"{study_id}_seg-spine_msk.nii.gz"
             shutil.copy(f, dest)
             outputs['semantic_mask'] = dest
-            logger.info("  ✓ Semantic mask")
+            logger.info("  ✓ Semantic mask (seg-spine)")
         
         # Centroids
         f = find_file("*_ctd.json")
@@ -215,7 +242,7 @@ def run_spineps(nifti_path: Path, seg_dir: Path, study_id: str) -> dict:
             dest = seg_dir / f"{study_id}_ctd.json"
             shutil.copy(f, dest)
             outputs['centroid_json'] = dest
-            logger.info("  ✓ Centroids")
+            logger.info("  ✓ Centroids JSON (ctd)")
             
             # Add ALL centroids
             if 'instance_mask' in outputs and 'semantic_mask' in outputs:
@@ -235,22 +262,41 @@ def run_spineps(nifti_path: Path, seg_dir: Path, study_id: str) -> dict:
         if 'semantic_mask' in outputs:
             if compute_uncertainty_from_softmax(derivatives_base, study_id, seg_dir):
                 outputs['uncertainty_map'] = seg_dir / f"{study_id}_unc.nii.gz"
-                logger.info("  ✓ Uncertainty map")
+        
+        if 'instance_mask' not in outputs:
+            logger.error("  Instance mask missing — treating as failure")
+            return None
         
         return outputs if outputs else None
     
+    except subprocess.TimeoutExpired:
+        logger.error("  SPINEPS timed out (>600s)")
+        sys.stdout.flush()
+        return None
     except Exception as e:
         logger.error(f"  SPINEPS error: {e}")
+        logger.debug(traceback.format_exc())
+        sys.stdout.flush()
         return None
+
+
+# ============================================================================
+# PROGRESS TRACKING
+# ============================================================================
 
 
 def load_progress(progress_file: Path) -> dict:
     if progress_file.exists():
         try:
             with open(progress_file, 'r') as f:
-                return json.load(f)
-        except Exception:
-            pass
+                progress = json.load(f)
+            logger.info(
+                f"Resuming: {len(progress['success'])} done, "
+                f"{len(progress['failed'])} failed previously"
+            )
+            return progress
+        except Exception as e:
+            logger.warning(f"Could not load progress file: {e} — starting fresh")
     return {'processed': [], 'success': [], 'failed': []}
 
 
@@ -260,8 +306,13 @@ def save_progress(progress_file: Path, progress: dict):
         with open(tmp, 'w') as f:
             json.dump(progress, f, indent=2)
         tmp.replace(progress_file)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Could not save progress: {e}")
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
 
 
 def main():
@@ -305,21 +356,31 @@ def main():
         if study_id not in already_processed:
             study_files.append((study_id, f))
     
+    remaining = len(study_files)
+    skipped = len(nifti_files) - remaining
+    
     logger.info("=" * 70)
-    logger.info("SPINEPS SEGMENTATION")
+    logger.info("SPINEPS SEGMENTATION PIPELINE")
     logger.info("=" * 70)
-    logger.info(f"Mode:         {args.mode}")
-    logger.info(f"Total:        {len(nifti_files)}")
-    logger.info(f"Already done: {len(nifti_files) - len(study_files)}")
-    logger.info(f"To process:   {len(study_files)}")
-    logger.info(f"Output:       {output_dir}")
+    logger.info(f"Mode:             {args.mode}")
+    logger.info(f"Total studies:    {len(nifti_files)}")
+    logger.info(f"Already done:     {skipped}")
+    logger.info(f"To process:       {remaining}")
+    logger.info(f"Output root:      {output_dir}")
+    logger.info("")
+    logger.info("Features enabled:")
+    logger.info("  ✓ All structure centroids (vertebrae, discs, endplates, subregions)")
+    logger.info("  ✓ Uncertainty maps")
+    logger.info("  ✓ DICOM-aligned masks for overlay")
     logger.info("=" * 70)
+    sys.stdout.flush()
     
     success_count = len(progress['success'])
     error_count = len(progress['failed'])
     
-    for study_id, nifti_path in tqdm(study_files, desc="Segmenting"):
+    for study_id, nifti_path in tqdm(study_files, desc="Studies"):
         logger.info(f"\n[{study_id}]")
+        sys.stdout.flush()
         
         try:
             outputs = run_spineps(nifti_path, seg_dir, study_id)
@@ -330,35 +391,46 @@ def main():
                 save_progress(progress_file, progress)
                 success_count += 1
                 logger.info(f"  ✓ Done ({len(outputs)} outputs)")
+                sys.stdout.flush()
             else:
-                logger.warning(f"  ✗ Failed")
+                logger.warning(f"  ✗ SPINEPS failed")
                 progress['processed'].append(study_id)
                 progress['failed'].append(study_id)
                 save_progress(progress_file, progress)
                 error_count += 1
+                sys.stdout.flush()
         
         except KeyboardInterrupt:
-            logger.warning("\n⚠ Interrupted - progress saved")
+            logger.warning("\n⚠ Interrupted — progress saved")
+            sys.stdout.flush()
             break
         except Exception as e:
-            logger.error(f"  ✗ Error: {e}")
+            logger.error(f"  ✗ Unexpected error: {e}")
+            logger.debug(traceback.format_exc())
             progress['processed'].append(study_id)
             progress['failed'].append(study_id)
             save_progress(progress_file, progress)
             error_count += 1
+            sys.stdout.flush()
     
     logger.info("\n" + "=" * 70)
-    logger.info("SPINEPS COMPLETE")
+    logger.info("DONE")
     logger.info("=" * 70)
-    logger.info(f"Success: {success_count}")
-    logger.info(f"Failed:  {error_count}")
-    logger.info(f"Total:   {success_count + error_count}")
+    logger.info(f"Success:  {success_count}")
+    logger.info(f"Failed:   {error_count}")
+    logger.info(f"Total:    {success_count + error_count}")
+    if progress['failed']:
+        logger.info(f"Failed IDs: {progress['failed']}")
+    logger.info(f"Progress: {progress_file}")
     logger.info("")
     logger.info("Outputs per study:")
-    logger.info(f"  • {seg_dir}/*_seg-vert_msk.nii.gz")
-    logger.info(f"  • {seg_dir}/*_seg-spine_msk.nii.gz")
-    logger.info(f"  • {seg_dir}/*_ctd.json (ALL structures)")
-    logger.info(f"  • {seg_dir}/*_unc.nii.gz")
+    logger.info("  • *_seg-vert_msk.nii.gz  - Instance mask (vertebrae, discs, endplates)")
+    logger.info("  • *_seg-spine_msk.nii.gz - Semantic mask (subregions)")
+    logger.info("  • *_ctd.json             - Centroids for ALL structures")
+    logger.info("  • *_unc.nii.gz           - Uncertainty map")
+    logger.info("")
+    logger.info("For DICOM overlay: All masks are in the same space as input NIfTI")
+    sys.stdout.flush()
     
     return 0 if error_count == 0 else 1
 
