@@ -381,15 +381,8 @@ def main():
         # Skip both successful and failed
         already_processed = set(progress['processed'])
     
-    # Find sagittal T2 NIfTI files in per-study subdirectories
-    study_dirs = sorted([d for d in nifti_dir.iterdir() if d.is_dir()])
-    
-    # Filter to only those with sagittal T2
-    nifti_files = []
-    for study_dir in study_dirs:
-        sag_t2 = study_dir / "sag_t2.nii.gz"
-        if sag_t2.exists():
-            nifti_files.append(sag_t2)
+    # Find sagittal T2 NIfTI files (BIDS format: sub-*_acq-sag_T2w.nii.gz)
+    nifti_files = sorted(nifti_dir.glob("sub-*_acq-sag_T2w.nii.gz"))
     
     if args.mode == 'debug':
         nifti_files = nifti_files[:1]
@@ -401,7 +394,8 @@ def main():
     # Extract study IDs and filter
     study_files = []
     for f in nifti_files:
-        study_id = f.parent.name  # Parent directory is the study ID
+        # Extract study ID from BIDS filename: "sub-100206310_acq-sag_T2w.nii.gz" -> "100206310"
+        study_id = f.stem.split('_')[0].replace('sub-', '')
         if study_id not in already_processed:
             study_files.append((study_id, f))
     
@@ -490,18 +484,15 @@ def main():
         logger.info(f"Failed IDs: {progress['failed']}")
     logger.info(f"Progress: {progress_file}")
     logger.info("")
-    logger.info("Directory structure:")
-    logger.info(f"  Input:  {nifti_dir}/<study_id>/sag_t2.nii.gz")
-    logger.info(f"          {nifti_dir}/<study_id>/derivatives_seg/  (SPINEPS temp)")
+    logger.info("Outputs per study:")
+    logger.info("  • <study_id>_seg-vert_msk.nii.gz  - Instance mask")
+    logger.info("  • <study_id>_seg-spine_msk.nii.gz - Semantic mask")
+    logger.info("  • <study_id>_seg-subreg_msk.nii.gz - Sub-region mask")
+    logger.info("  • <study_id>_ctd.json - Centroids (ALL structures)")
+    logger.info("  • <study_id>_unc.nii.gz - Uncertainty map")
     logger.info("")
-    logger.info(f"  Output: {seg_dir}/")
-    logger.info("    ├── <study_id>_seg-vert_msk.nii.gz")
-    logger.info("    ├── <study_id>_seg-spine_msk.nii.gz")
-    logger.info("    ├── <study_id>_seg-subreg_msk.nii.gz")
-    logger.info("    ├── <study_id>_ctd.json")
-    logger.info("    └── <study_id>_unc.nii.gz")
-    logger.info("")
-    logger.info(f"  Metadata: {metadata_dir}/<study_id>_metadata.json")
+    logger.info(f"All outputs: {seg_dir}/")
+    logger.info(f"Metadata: {metadata_dir}/")
     sys.stdout.flush()
     
     return 0 if error_count == 0 else 1

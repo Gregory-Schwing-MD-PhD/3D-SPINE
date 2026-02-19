@@ -169,13 +169,9 @@ def load_dicom_series(dicom_dir: Path) -> tuple:
         return None, None, None
 
 
-def convert_dicom_to_nifti(dicom_dir: Path, output_path: Path, 
-                           series_type: str) -> Path:
+def convert_dicom_to_nifti(dicom_dir: Path, output_path: Path) -> Path:
     """
     Convert DICOM series to NIfTI using pydicom + nibabel.
-    
-    Args:
-        series_type: 'sag_t2' or 'axial_t2' for naming
     """
     try:
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -301,10 +297,6 @@ def main():
         study_id = study_dir.name
         logger.info(f"\n[{study_id}]")
         
-        # Create per-study NIfTI directory
-        study_nifti_dir = output_dir / study_id
-        study_nifti_dir.mkdir(parents=True, exist_ok=True)
-        
         conversions = {}
         
         try:
@@ -315,10 +307,9 @@ def main():
             
             if sag_series:
                 logger.info(f"  Sagittal T2: {sag_series.name}")
-                sag_output = study_nifti_dir / "sag_t2.nii.gz"
-                sag_nifti = convert_dicom_to_nifti(
-                    sag_series, sag_output, 'sag_t2'
-                )
+                # BIDS format: sub-<id>_acq-<label>_T2w.nii.gz
+                sag_output = output_dir / f"sub-{study_id}_acq-sag_T2w.nii.gz"
+                sag_nifti = convert_dicom_to_nifti(sag_series, sag_output)
                 if sag_nifti:
                     conversions['sagittal_t2'] = {
                         'series_id': sag_series.name,
@@ -334,10 +325,9 @@ def main():
             
             if axial_series:
                 logger.info(f"  Axial T2: {axial_series.name}")
-                axial_output = study_nifti_dir / "axial_t2.nii.gz"
-                axial_nifti = convert_dicom_to_nifti(
-                    axial_series, axial_output, 'axial_t2'
-                )
+                # BIDS format: sub-<id>_acq-<label>_T2w.nii.gz
+                axial_output = output_dir / f"sub-{study_id}_acq-axial_T2w.nii.gz"
+                axial_nifti = convert_dicom_to_nifti(axial_series, axial_output)
                 if axial_nifti:
                     conversions['axial_t2'] = {
                         'series_id': axial_series.name,
@@ -378,13 +368,10 @@ def main():
     logger.info(f"Failed:  {error_count}")
     logger.info(f"Total:   {success_count + error_count}")
     logger.info("")
-    logger.info("Directory structure:")
-    logger.info(f"  {output_dir}/")
-    logger.info("    ├── <study_id>/")
-    logger.info("    │   ├── sag_t2.nii.gz")
-    logger.info("    │   └── axial_t2.nii.gz")
-    logger.info("    └── metadata/")
-    logger.info("        └── <study_id>_conversion.json")
+    logger.info("Outputs:")
+    logger.info(f"  • {output_dir}/sub-<study_id>_acq-sag_T2w.nii.gz")
+    logger.info(f"  • {output_dir}/sub-<study_id>_acq-axial_T2w.nii.gz")
+    logger.info(f"  • {metadata_dir}/<study_id>_conversion.json")
     logger.info("")
     logger.info("Next steps:")
     logger.info("  1. sbatch slurm_scripts/02_spineps.sh")
