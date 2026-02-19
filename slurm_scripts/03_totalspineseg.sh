@@ -48,7 +48,7 @@ mkdir -p logs "$OUTPUT_DIR"
 
 # --- Container ---
 # TotalSegmentator container (adjust if you have a custom one)
-CONTAINER="docker://wasserth/totalsegmentator:latest"
+CONTAINER="docker://wasserth/totalsegmentator:2.12.0"
 IMG_PATH="${NXF_SINGULARITY_CACHEDIR}/totalsegmentator.sif"
 
 if [[ ! -f "$IMG_PATH" ]]; then
