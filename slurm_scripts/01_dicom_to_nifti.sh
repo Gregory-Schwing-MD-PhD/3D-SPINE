@@ -45,8 +45,8 @@ OUTPUT_DIR="${PROJECT_DIR}/results/nifti"
 mkdir -p logs "$OUTPUT_DIR"
 
 # --- Container ---
-CONTAINER="docker://go2432/spineps-preprocessing:latest"
-IMG_PATH="${NXF_SINGULARITY_CACHEDIR}/spineps-preprocessing.sif"
+CONTAINER="docker://go2432/spineps-segmentation:latest"
+IMG_PATH="${NXF_SINGULARITY_CACHEDIR}/spineps-segmentation.sif"
 
 if [[ ! -f "$IMG_PATH" ]]; then
     singularity pull "$IMG_PATH" "$CONTAINER"
