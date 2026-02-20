@@ -343,7 +343,11 @@ def main():
     if args.study_id:
         study_ids = [args.study_id]
     else:
-        study_ids = sorted(d.name for d in nifti_dir.iterdir() if d.is_dir())
+        SKIP_DIRS = {'metadata'}
+        study_ids = sorted(
+            d.name for d in nifti_dir.iterdir()
+            if d.is_dir() and d.name not in SKIP_DIRS
+        )
         if args.mode == 'trial':
             study_ids = study_ids[:5]
         skip = set(progress['processed'])
