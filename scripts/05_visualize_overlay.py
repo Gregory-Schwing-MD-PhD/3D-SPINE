@@ -6,16 +6,16 @@ Visualizes SPINEPS and TotalSpineSeg outputs for one study (or all studies
 in batch mode), including both uncertainty maps and the contact zone used
 by 04_detect_lstv.py to decide between Castellvi Type II and III.
 
-Output: one 3×3 panel PNG per study saved to --output_dir.
+Output: one 3x3 panel PNG per study saved to --output_dir.
 
-  Row 0 │ Original image      │ SPINEPS instance mask  │ TotalSpineSeg labeled mask
-  Row 1 │ SPINEPS uncertainty │ TSS uncertainty         │ Contact zone
-  Row 2 │ Isolated TPs at TV  │ SPINEPS semantic (all)  │ Classification summary
+  Row 0 | Original image      | SPINEPS instance mask  | TotalSpineSeg labeled mask
+  Row 1 | SPINEPS uncertainty | TSS uncertainty         | Contact zone
+  Row 2 | Isolated TPs at TV  | SPINEPS semantic (all)  | Classification summary
 
 All NIfTIs are reoriented to canonical RAS (nib.as_closest_canonical) before
-any slicing so axis 0 = L-R, axis 2 = I-S — identical to 04_detect_lstv.py.
+any slicing so axis 0 = L-R, axis 2 = I-S -- identical to 04_detect_lstv.py.
 
-Usage — single study:
+Usage -- single study:
     python visualize_overlay.py \
         --study_id       1020394063 \
         --spineps_dir    results/spineps \
@@ -24,7 +24,7 @@ Usage — single study:
         [--lstv_json     results/lstv_detection/lstv_results.json] \
         [--slice         N]
 
-Usage — batch (all studies found under spineps_dir/segmentations/):
+Usage -- batch (all studies found under spineps_dir/segmentations/):
     python visualize_overlay.py \
         --spineps_dir    results/spineps \
         --totalspine_dir results/totalspineseg \
@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# CONSTANTS — kept in sync with 04_detect_lstv.py
+# CONSTANTS -- kept in sync with 04_detect_lstv.py
 # ============================================================================
 
 TP_HEIGHT_MM        = 19.0
@@ -65,7 +65,7 @@ SACRUM_LABEL        = 50
 L5_LABEL            = 45
 L6_LABEL            = 46
 
-# TotalSpineSeg display colours: label → ([R,G,B], display name)
+# TotalSpineSeg display colours: label -> ([R,G,B], display name)
 TSS_LABEL_COLORS = {
     41:  ([0.20, 0.40, 0.80], 'L1'),
     42:  ([0.25, 0.50, 0.85], 'L2'),
@@ -80,7 +80,7 @@ TSS_LABEL_COLORS = {
 
 
 # ============================================================================
-# NIfTI HELPERS — mirror 04_detect_lstv.py exactly so geometry is identical
+# NIfTI HELPERS -- mirror 04_detect_lstv.py exactly so geometry is identical
 # ============================================================================
 
 def load_canonical(path: Path) -> Tuple[np.ndarray, nib.Nifti1Image]:
@@ -141,10 +141,6 @@ def overlay_mask(ax, mask2d: np.ndarray, color_rgb, alpha: float = 0.65):
 def _pick_best_sag_slice(vol3d: np.ndarray,
                          highlight: Optional[np.ndarray] = None,
                          override: Optional[int] = None) -> int:
-    """
-    Return the sagittal (axis-0) index to display.
-    Priority: override → slice with most highlight voxels → mid-volume.
-    """
     if override is not None:
         return min(override, vol3d.shape[0] - 1)
     if highlight is not None and highlight.any():
@@ -153,7 +149,6 @@ def _pick_best_sag_slice(vol3d: np.ndarray,
 
 
 def _sag(vol: Optional[np.ndarray], sl: int) -> np.ndarray:
-    """Safe sagittal slice extraction; returns zeros if vol is None."""
     if vol is None:
         return np.zeros((1, 1))
     return vol[min(sl, vol.shape[0] - 1), :, :]
@@ -199,7 +194,7 @@ def _panel_tss_labeled(ax, img_sl, tss_sl):
 
 def _panel_uncertainty(ax, unc_sl, title):
     im = ax.imshow(norm(unc_sl).T, cmap='hot', origin='lower', vmin=0, vmax=1)
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Entropy [0–1]')
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Entropy [0-1]')
     ax.set_title(title, fontsize=11)
     ax.axis('off')
 
@@ -207,11 +202,9 @@ def _panel_uncertainty(ax, unc_sl, title):
 def _panel_contact_zone(ax, img_sl, cz_left, cz_right,
                         tp_left_sl, tp_right_sl, sacrum_sl):
     ax.imshow(norm(img_sl).T, cmap='gray', origin='lower', alpha=0.65)
-    # faint anatomy context
     overlay_mask(ax, sacrum_sl,   [1.00, 0.55, 0.00], 0.25)
     overlay_mask(ax, tp_left_sl,  [1.00, 0.10, 0.10], 0.20)
     overlay_mask(ax, tp_right_sl, [0.00, 0.80, 1.00], 0.20)
-    # contact zones bright
     overlay_mask(ax, cz_left,  [1.00, 0.00, 1.00], 0.85)
     overlay_mask(ax, cz_right, [0.00, 1.00, 0.50], 0.85)
     ax.legend(handles=[
@@ -237,7 +230,6 @@ def _panel_tp_isolated(ax, img_sl, tp_left_sl, tp_right_sl, sacrum_sl, tv_name, 
 
 
 def _panel_spineps_semantic(ax, img_sl, sem_sl):
-    """Original-style panel: all TPs highlighted, others faint cyan."""
     ax.imshow(norm(img_sl).T, cmap='gray', origin='lower', alpha=0.7)
     costal = (sem_sl == TP_LEFT_LABEL) | (sem_sl == TP_RIGHT_LABEL)
     overlay_mask(ax, sem_sl == TP_LEFT_LABEL,  [1.00, 0.10, 0.10], 0.80)
@@ -252,6 +244,17 @@ def _panel_spineps_semantic(ax, img_sl, sem_sl):
 
 
 def _panel_summary(ax, study_id: str, result: Optional[dict], tv_name: str):
+    """
+    Classification summary panel -- updated for 04_detect_lstv.py v2 output
+    which uses probabilistic uncertainty scoring instead of a single threshold.
+
+    New fields consumed:
+      result[side]['p_type_ii']    : float
+      result[side]['p_type_iii']   : float
+      result[side]['confidence']   : 'high' | 'moderate' | 'low'
+      result[side]['unc_features'] : dict with unc_mean, unc_std, unc_high_frac, source
+      result['confidence']         : overall confidence
+    """
     ax.axis('off')
     ax.set_facecolor('#1a1a2e')
 
@@ -261,29 +264,52 @@ def _panel_summary(ax, study_id: str, result: Optional[dict], tv_name: str):
         lines += ['No detection results available.', '',
                   'Run 04_detect_lstv.py and pass', '--lstv_json to annotate this panel.']
     else:
-        ct       = result.get('castellvi_type') or 'None (no LSTV)'
-        detected = result.get('lstv_detected', False)
-        lines += [f'Castellvi : {ct}',
-                  f'LSTV      : {"YES  ⚠" if detected else "No"}', '']
+        ct           = result.get('castellvi_type') or 'None (no LSTV)'
+        detected     = result.get('lstv_detected', False)
+        overall_conf = result.get('confidence', '')
+        lines += [
+            f'Castellvi : {ct}',
+            f'LSTV      : {"YES  !" if detected else "No"}',
+            f'Confidence: {overall_conf}',
+            '',
+        ]
 
         for side in ('left', 'right'):
             sd = result.get(side, {})
             if not sd:
                 continue
+
             lines += [
                 f'{"Left" if side == "left" else "Right"} side:',
-                f'  {sd.get("classification","?"):8s}',
-                f'  TP height   {sd.get("tp_height_mm", 0):.1f} mm'
-                f'  (thresh {TP_HEIGHT_MM} mm)',
-                f'  TP↔Sacrum  {sd.get("dist_mm", float("inf")):.1f} mm'
-                f'  (thresh {CONTACT_DIST_MM} mm)',
+                f'  Class     : {sd.get("classification", "?")}',
+                f'  TP height : {sd.get("tp_height_mm", 0):.1f} mm  (thresh {TP_HEIGHT_MM} mm)',
+                f'  TP-Sacrum : {sd.get("dist_mm", float("inf")):.1f} mm  (thresh {CONTACT_DIST_MM} mm)',
             ]
-            unc_t = sd.get('mean_unc_tss')
-            unc_s = sd.get('mean_unc_spineps')
-            if unc_t is not None:
-                lines.append(f'  Unc TSS     {unc_t:.3f}  (thresh 0.35)')
-            if unc_s is not None:
-                lines.append(f'  Unc SPINEPS {unc_s:.3f}')
+
+            # Probabilistic output (only present for contact cases)
+            p2 = sd.get('p_type_ii')
+            p3 = sd.get('p_type_iii')
+            if p2 is not None and p3 is not None:
+                lines.append(
+                    f'  P(II)={p2:.2f}  P(III)={p3:.2f}  [{sd.get("confidence", "")}]'
+                )
+
+            # Uncertainty feature vector
+            unc = sd.get('unc_features') or {}
+            if unc and unc.get('unc_mean') is not None:
+                try:
+                    lines.append(
+                        f'  unc mean={unc["unc_mean"]:.3f}'
+                        f'  std={unc.get("unc_std", float("nan")):.3f}'
+                        f'  hi_frac={unc.get("unc_high_frac", float("nan")):.3f}'
+                        f'  [{unc.get("source", "")}]'
+                    )
+                except (TypeError, ValueError):
+                    pass  # NaN formatting edge case
+
+            if sd.get('note'):
+                lines.append(f'  NOTE: {sd["note"]}')
+
             lines.append('')
 
         if result.get('errors'):
@@ -313,18 +339,18 @@ def visualize_study(
     slice_override: Optional[int] = None,
     result: Optional[dict] = None,
 ):
-    """Build and save the 3×3 panel PNG for one study."""
+    """Build and save the 3x3 panel PNG for one study."""
     output_dir.mkdir(parents=True, exist_ok=True)
     out_path = output_dir / f"{study_id}_lstv_overlay.png"
 
-    # ── Resolve file paths (matching pipeline conventions) ───────────────────
-    sp_sem_path  = spineps_dir / 'segmentations' / study_id / f"{study_id}_seg-spine_msk.nii.gz"
-    sp_inst_path = spineps_dir / 'segmentations' / study_id / f"{study_id}_seg-vert_msk.nii.gz"
-    sp_unc_path  = spineps_dir / 'segmentations' / study_id / f"{study_id}_unc.nii.gz"
+    # ---- Resolve file paths -------------------------------------------------
+    sp_sem_path   = spineps_dir / 'segmentations' / study_id / f"{study_id}_seg-spine_msk.nii.gz"
+    sp_inst_path  = spineps_dir / 'segmentations' / study_id / f"{study_id}_seg-vert_msk.nii.gz"
+    sp_unc_path   = spineps_dir / 'segmentations' / study_id / f"{study_id}_unc.nii.gz"
     tss_mask_path = totalspine_dir / study_id / 'sagittal' / f"{study_id}_sagittal_labeled.nii.gz"
     tss_unc_path  = totalspine_dir / study_id / 'sagittal' / f"{study_id}_sagittal_unc.nii.gz"
 
-    # ── Load everything in canonical orientation ──────────────────────────────
+    # ---- Load everything in canonical orientation ----------------------------
     def try_load(path, label):
         if path.exists():
             try:
@@ -335,22 +361,19 @@ def visualize_study(
             logger.warning(f"  [{study_id}] Missing: {path.name}")
         return None, None
 
-    sp_sem_data,  sp_sem_nii  = try_load(sp_sem_path,   'SPINEPS semantic')
-    sp_inst_data, _           = try_load(sp_inst_path,  'SPINEPS instance')
-    sp_unc_data,  _           = try_load(sp_unc_path,   'SPINEPS uncertainty')
-    tss_data,     tss_nii     = try_load(tss_mask_path, 'TSS labeled')
-    tss_unc_data, _           = try_load(tss_unc_path,  'TSS uncertainty')
+    sp_sem_data,  sp_sem_nii = try_load(sp_sem_path,   'SPINEPS semantic')
+    sp_inst_data, _          = try_load(sp_inst_path,  'SPINEPS instance')
+    sp_unc_data,  _          = try_load(sp_unc_path,   'SPINEPS uncertainty')
+    tss_data,     tss_nii    = try_load(tss_mask_path, 'TSS labeled')
+    tss_unc_data, _          = try_load(tss_unc_path,  'TSS uncertainty')
 
-    # Need at least one primary volume
     if sp_sem_data is None and tss_data is None:
-        logger.error(f"  [{study_id}] No usable data — skipping")
+        logger.error(f"  [{study_id}] No usable data -- skipping")
         return
 
-    # Background image for all anatomy panels
     bg_data = sp_sem_data if sp_sem_data is not None else tss_data
     bg_nii  = sp_sem_nii  if sp_sem_nii  is not None else tss_nii
 
-    # Cast integer masks
     if sp_sem_data  is not None: sp_sem_data  = sp_sem_data.astype(int)
     if sp_inst_data is not None: sp_inst_data = sp_inst_data.astype(int)
     if tss_data     is not None: tss_data     = tss_data.astype(int)
@@ -360,16 +383,15 @@ def visualize_study(
     vox_bg  = voxel_size_mm(bg_nii)
     vox_tss = voxel_size_mm(tss_nii) if tss_nii is not None else vox_bg
 
-    # ── Target Vertebra ───────────────────────────────────────────────────────
+    # ---- Target Vertebra -----------------------------------------------------
     tv_label = (L6_LABEL
                 if tss_data is not None and L6_LABEL in np.unique(tss_data)
                 else L5_LABEL)
     tv_name  = 'L6' if tv_label == L6_LABEL else 'L5'
 
-    # ── Build 3-D isolated TP and contact-zone masks ──────────────────────────
+    # ---- Build 3-D masks -----------------------------------------------------
     z_range = get_tv_z_range(tss_data, tv_label) if tss_data is not None else None
-
-    zeros3 = np.zeros(bg_data.shape, dtype=bool)
+    zeros3  = np.zeros(bg_data.shape, dtype=bool)
 
     if z_range is not None and sp_sem_data is not None:
         z_min, z_max = z_range
@@ -380,50 +402,44 @@ def visualize_study(
 
     sacrum_3d = (tss_data == SACRUM_LABEL) if tss_data is not None else zeros3
 
-    # Contact zones (in TSS voxel space; best-effort if grids differ)
     def _cz(tp_mask):
         if tp_mask.any() and sacrum_3d.any():
-            # Pad/clip masks to common shape if volumes differ
-            common_shape = tuple(min(a, b) for a, b in zip(tp_mask.shape, sacrum_3d.shape))
-            tp_c  = tp_mask[:common_shape[0], :common_shape[1], :common_shape[2]]
-            sac_c = sacrum_3d[:common_shape[0], :common_shape[1], :common_shape[2]]
-            cz    = build_contact_zone(tp_c, sac_c, vox_tss, CONTACT_DILATION_MM)
-            # Pad back to bg_data shape for slicing
-            out = np.zeros(bg_data.shape, dtype=bool)
+            common = tuple(min(a, b) for a, b in zip(tp_mask.shape, sacrum_3d.shape))
+            tp_c   = tp_mask[:common[0],   :common[1], :common[2]]
+            sac_c  = sacrum_3d[:common[0], :common[1], :common[2]]
+            cz     = build_contact_zone(tp_c, sac_c, vox_tss, CONTACT_DILATION_MM)
+            out    = np.zeros(bg_data.shape, dtype=bool)
             out[:cz.shape[0], :cz.shape[1], :cz.shape[2]] = cz
             return out
         return zeros3
 
     cz_left_3d  = _cz(tp_left_3d)
     cz_right_3d = _cz(tp_right_3d)
-
-    # ── Choose display slices ─────────────────────────────────────────────────
     cz_combined = cz_left_3d | cz_right_3d
 
-    # Standard panels: mid-sagittal (or override)
+    # ---- Choose display slices -----------------------------------------------
     sl_main = _pick_best_sag_slice(bg_data, override=slice_override)
-
-    # Contact-zone panel: whichever sagittal slice shows the most contact voxels
-    sl_cz = _pick_best_sag_slice(bg_data, highlight=cz_combined,
-                                  override=slice_override)
+    sl_cz   = _pick_best_sag_slice(bg_data, highlight=cz_combined,
+                                   override=slice_override)
 
     def s(vol, sl=None):
         return _sag(vol, sl if sl is not None else sl_main)
 
-    # ── Assemble figure ───────────────────────────────────────────────────────
+    # ---- Assemble figure -----------------------------------------------------
     fig, axes = plt.subplots(3, 3, figsize=(21, 21))
     fig.patch.set_facecolor('#0d0d1a')
     for ax in axes.flat:
         ax.set_facecolor('#0d0d1a')
 
     castellvi = result.get('castellvi_type') if result else None
+    conf_str  = f"  confidence: {result.get('confidence','')}" if result else ''
     fig.suptitle(
-        f"Study {study_id}   │   Castellvi: {castellvi or 'N/A'}"
-        f"   │   TV: {tv_name}",
+        f"Study {study_id}   |   Castellvi: {castellvi or 'N/A'}{conf_str}"
+        f"   |   TV: {tv_name}",
         fontsize=15, color='white', y=0.998,
     )
 
-    # ── Row 0: anatomy ────────────────────────────────────────────────────────
+    # Row 0: anatomy
     _panel_original(axes[0, 0], s(bg_data), sl_main)
 
     if sp_inst_data is not None:
@@ -436,7 +452,7 @@ def visualize_study(
     else:
         _unavailable(axes[0, 2], 'TotalSpineSeg labeled mask')
 
-    # ── Row 1: uncertainty + contact zone ─────────────────────────────────────
+    # Row 1: uncertainty + contact zone
     if sp_unc_data is not None:
         _panel_uncertainty(axes[1, 0], s(sp_unc_data),
                            'SPINEPS Uncertainty\n(Normalised Shannon Entropy)')
@@ -459,7 +475,7 @@ def visualize_study(
         sacrum_3d[min(sl_cz,   sacrum_3d.shape[0]-1),   :, :],
     )
 
-    # ── Row 2: TPs + semantic + summary ───────────────────────────────────────
+    # Row 2: TPs + semantic + summary
     _panel_tp_isolated(
         axes[2, 0], s(bg_data),
         tp_left_3d[min(sl_main,  tp_left_3d.shape[0]-1),  :, :],
@@ -479,7 +495,7 @@ def visualize_study(
     plt.savefig(out_path, dpi=150, bbox_inches='tight',
                 facecolor=fig.get_facecolor())
     plt.close()
-    logger.info(f"  [{study_id}] ✓  {out_path}")
+    logger.info(f"  [{study_id}] OK  {out_path}")
 
 
 # ============================================================================
@@ -488,17 +504,13 @@ def visualize_study(
 
 def main():
     parser = argparse.ArgumentParser(description='LSTV Overlay Visualizer')
-    parser.add_argument('--spineps_dir',    required=True,
-                        help='SPINEPS output directory')
-    parser.add_argument('--totalspine_dir', required=True,
-                        help='TotalSpineSeg output directory')
-    parser.add_argument('--output_dir',     required=True,
-                        help='Directory to write PNG files')
+    parser.add_argument('--spineps_dir',    required=True)
+    parser.add_argument('--totalspine_dir', required=True)
+    parser.add_argument('--output_dir',     required=True)
     parser.add_argument('--study_id',       default=None,
                         help='Single study ID (omit for batch mode)')
     parser.add_argument('--lstv_json',      default=None,
-                        help='lstv_results.json from 04_detect_lstv.py '
-                             '(annotates summary panel)')
+                        help='lstv_results.json from 04_detect_lstv.py')
     parser.add_argument('--slice',          type=int, default=None,
                         help='Override sagittal slice index (default: mid-volume)')
     args = parser.parse_args()
@@ -507,7 +519,6 @@ def main():
     totalspine_dir = Path(args.totalspine_dir)
     output_dir     = Path(args.output_dir)
 
-    # Load detection results if provided
     results_by_id = {}
     if args.lstv_json:
         json_path = Path(args.lstv_json)
@@ -545,7 +556,7 @@ def main():
             errors += 1
 
     logger.info(
-        f"Done. {len(study_ids)-errors}/{len(study_ids)} PNGs saved → {output_dir}"
+        f"Done. {len(study_ids)-errors}/{len(study_ids)} PNGs saved -> {output_dir}"
     )
     return 0 if errors == 0 else 1
 
