@@ -414,23 +414,32 @@ def classify_study(study_id: str,
     named = [VERIDAH_NAMES.get(l, str(l)) for l in unique_vert]
     logger.info(f"  [{study_id}] VERIDAH named: {named}")
 
-    has_l6   = L6_LABEL in unique_vert
-    tv_label = L6_LABEL if has_l6 else L5_LABEL
-    tv_name  = 'L6' if has_l6 else 'L5'
+    # Pick TV: L6 > L5 > inferiormost lumbar label found
+    # VERIDAH sometimes only labels up to L4 on short FOV scans — use
+    # whatever the inferiormost lumbar vertebra is rather than erroring out.
+    LUMBAR_LABELS = [25, 24, 23, 22, 21, 20]  # L6 down to L1, pick highest present
+    tv_label, tv_name = None, None
+    for candidate in LUMBAR_LABELS:
+        if candidate in unique_vert:
+            tv_label = candidate
+            tv_name  = VERIDAH_NAMES.get(candidate, str(candidate))
+            break
 
-    tv_z_range = get_tv_z_range(vert_data, tv_label)
-    if tv_z_range is None:
-        msg = (f'TV label {tv_name} (VERIDAH={tv_label}) not found in instance mask. '
-               f'Labels present: {unique_vert} ({named}). '
-               f'VERIDAH may have failed to label this study or used non-standard labels.')
+    if tv_label is None:
+        msg = f'No lumbar labels (20-25) found. Labels present: {unique_vert} ({named}).'
         logger.error(f"  [{study_id}] ✗ {msg}")
         out['errors'].append(msg)
         return out
 
+    if tv_label not in (L5_LABEL, L6_LABEL):
+        logger.warning(f"  [{study_id}] ⚠ L5/L6 absent — using inferiormost label {tv_name} ({tv_label}) as TV")
+
+    tv_z_range = get_tv_z_range(vert_data, tv_label)
+
     out['details'] = {
         'tv_label':            tv_label,
         'tv_name':             tv_name,
-        'has_l6':              has_l6,
+        'has_l6':              tv_label == L6_LABEL,
         'sacrum_present':      bool(sacrum_mask.any()),
         'tv_z_range':          list(tv_z_range),
         'vox_mm':              vox_mm.tolist(),

@@ -590,13 +590,24 @@ def visualize_study(study_id: str,
     vert_data   = vert_data.astype(int)
     vox_mm      = voxel_size_mm(subreg_nii)
 
-    has_l6   = L6_LABEL in np.unique(vert_data)
-    tv_label = L6_LABEL if has_l6 else L5_LABEL
-    tv_name  = 'L6' if has_l6 else 'L5'
+    # Pick TV: L6 > L5 > inferiormost lumbar label (matches 04_detect_lstv.py logic)
+    VERIDAH_NAMES = {20:'L1',21:'L2',22:'L3',23:'L4',24:'L5',25:'L6'}
+    LUMBAR_LABELS = [25, 24, 23, 22, 21, 20]
+    unique_vert   = set(np.unique(vert_data).tolist())
+    tv_label, tv_name = None, None
+    for candidate in LUMBAR_LABELS:
+        if candidate in unique_vert:
+            tv_label = candidate
+            tv_name  = VERIDAH_NAMES.get(candidate, str(candidate))
+            break
+
+    if tv_label is None:
+        logger.error(f"  [{study_id}] No lumbar labels found — skipping")
+        return None
 
     z_range = get_tv_z_range(vert_data, tv_label)
     if z_range is None:
-        logger.error(f"  [{study_id}] TV label not found — skipping")
+        logger.error(f"  [{study_id}] TV label {tv_name} not found in mask — skipping")
         return None
     z_min_tv, z_max_tv = z_range
     z_tv_mid = (z_min_tv + z_max_tv) // 2
