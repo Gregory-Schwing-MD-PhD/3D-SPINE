@@ -1,32 +1,27 @@
 #!/usr/bin/env python3
 """
-05_visualize_overlay.py — LSTV Overlay Visualizer v8
+05_visualize_overlay.py — LSTV Overlay Visualizer v9
 =====================================================
-Fixes over v7
+Fixes over v8
 ─────────────────────────────────────────────────────────────────────────────
-1. RULER BUG FIXED — height bracket now operates on the LARGEST CONNECTED
-   COMPONENT of the TP mask in the sagittal slice, not raw z-extent of all
-   voxels with that label.  Disconnected blobs at other spinal levels
-   (mis-labelled or artifact) no longer inflate the bracket.
+1. ROW 0 AXIAL SLICE — now taken at the z-midpoint of the TP blob actually
+   being measured (largest CC of the L5 TP mask), not mean(z_tv, z_md).
+   The reference line in the sagittal panels also reflects this z.
 
-2. MIN-DIST RULER — sagittal panels in row 1 now draw a vertical gap ruler
-   from the inferior edge of the TP's largest CC to the superior edge of the
-   sacrum mask in the same sagittal slice.  Annotated in mm.
+2. ROW 1 AXIAL SLICE — confirmed at z_md_combined (min-dist slice).
 
-3. [0,2] — TSS Labels axial now also shows dilated TP masks (left+right)
-   projected onto the axial slice.
+3. REFERENCE LINES — simplified to ONE dashed line per sagittal panel:
+   - Row 0 panels: single cyan line at the axial z shown in [0,2]
+   - Row 1 panels: single orange line at the axial z shown in [1,2]
+   No more confusing double lines.
 
-4. [1,2] — TSS Labels axial at min-dist z now shows dilated TP masks
-   (slightly more prominent) on top of the TSS colours.
+4. SUMMARY TEXT — larger font (10.5 pt instead of 8.2 pt).
 
-5. [2,1] — replaced plain T2w with T2w + ALL TSS labels + ALL SPINEPS masks
-   at TV mid, giving a full combined anatomy panel.
-
-Layout (unchanged from v7)
+Layout (unchanged from v8)
 ─────────────────────────────────────────────────────────────────────────────
   [0,0]  Left  TP sagittal — max craniocaudal height  (Type I check)
   [0,1]  Right TP sagittal — max craniocaudal height  (Type I check)
-  [0,2]  TSS Labels axial at z_ref + TP mask projections
+  [0,2]  TSS Labels axial at z_tp_mid (midpoint of measured TP blob)
 
   [1,0]  Left  TP sagittal at z_md_L  (Type II/III check) + gap ruler
   [1,1]  Right TP sagittal at z_md_R  (Type II/III check) + gap ruler
@@ -192,6 +187,17 @@ def inferiormost_tp_cc(tp_mask3d: np.ndarray,
     return cc_info[0][2].astype(bool)
 
 
+def tp_blob_z_midpoint(tp_l5_3d: np.ndarray) -> int:
+    """
+    Return the z-index at the midpoint of the L5 TP blob's craniocaudal extent.
+    Used to pick the correct axial slice for Row 0.
+    """
+    if not tp_l5_3d.any():
+        return tp_l5_3d.shape[2] // 2
+    zc = np.where(tp_l5_3d)[2]
+    return int((zc.min() + zc.max()) // 2)
+
+
 # ============================================================================
 # FILE DISCOVERY
 # ============================================================================
@@ -260,10 +266,11 @@ def _unavailable(ax, label: str):
 
 
 def _hline(ax, z_sag: Optional[float], color: str, label: str = ''):
+    """Draw one horizontal reference line in a sagittal panel."""
     if z_sag is None:
         return
     y = float(z_sag)
-    ax.axhline(y=y, color=color, linewidth=1.3, linestyle='--', alpha=0.90)
+    ax.axhline(y=y, color=color, linewidth=1.6, linestyle='--', alpha=0.95)
     if label:
         ax.text(3, y + 1, label, color=color, fontsize=7, va='bottom',
                 fontweight='bold')
@@ -288,6 +295,26 @@ def ax_z_to_sag_z(ax_nii:  Optional[nib.Nifti1Image],
         return float(vx[2])
     except Exception as e:
         logger.debug(f"ax_z_to_sag_z: {e}")
+        return None
+
+
+def sag_z_to_ax_z(sag_nii: Optional[nib.Nifti1Image],
+                   ax_nii:  Optional[nib.Nifti1Image],
+                   z_sag:   int) -> Optional[int]:
+    """Convert a sagittal volume z-index to the nearest axial volume z-index."""
+    if sag_nii is None or ax_nii is None:
+        return None
+    try:
+        cx    = sag_nii.shape[0] / 2.0
+        cy    = sag_nii.shape[1] / 2.0
+        world = nib.affines.apply_affine(sag_nii.affine,
+                                          np.array([[cx, cy, z_sag]]))[0]
+        vx    = nib.affines.apply_affine(np.linalg.inv(ax_nii.affine),
+                                          world[np.newaxis])[0]
+        z_ax  = int(round(float(vx[2])))
+        return max(0, min(z_ax, ax_nii.shape[2] - 1))
+    except Exception as e:
+        logger.debug(f"sag_z_to_ax_z: {e}")
         return None
 
 
@@ -325,7 +352,6 @@ def best_x_for_tp_height(tp_l5_3d: np.ndarray,
     """
     Given the already-isolated L5 TP mask (3-D sagittal), find the x-slice
     with maximum craniocaudal z-span.  Returns (best_x, max_span_mm).
-    No further CC filtering needed — mask is already a single blob.
     """
     if not tp_l5_3d.any():
         return tp_l5_3d.shape[0] // 2, 0.0
@@ -395,29 +421,19 @@ def _draw_height_ruler(ax, mask2d: np.ndarray, vox_z_mm: float,
                         color: str = 'yellow') -> float:
     """
     Draw a vertical bracket spanning z_min→z_max of the LARGEST CONNECTED
-    COMPONENT of mask2d (shape X×Z, from a sagittal slice transposed for
-    imshow origin='lower').
-
-    mask2d is in (X, Z) order as returned by _sag_sl().
-    In the imshow display with .T and origin='lower', x→horizontal, z→vertical.
-    So the bracket is plotted in display coordinates:
-        horizontal axis = x (axis 0 of mask2d)
-        vertical axis   = z (axis 1 of mask2d)
-
+    COMPONENT of mask2d (shape X×Z).
     Returns measured span in mm (0.0 if mask is empty).
     """
     lcc = largest_cc_2d(mask2d)
     if not lcc.any():
         return 0.0
 
-    # z-indices (vertical in display)
     zc = np.where(lcc.any(axis=0))[0]
     if zc.size < 2:
         return 0.0
     z_lo, z_hi = int(zc.min()), int(zc.max())
     span_mm    = (z_hi - z_lo) * vox_z_mm
 
-    # x-position of bracket: centroid of LCC at middle z
     mid_z   = zc[len(zc) // 2]
     col_at  = lcc[:, mid_z]
     x_mid   = int(np.where(col_at)[0].mean()) if col_at.any() else lcc.shape[0] // 2
@@ -442,10 +458,7 @@ def _draw_gap_ruler(ax,
     """
     Draw a vertical gap ruler from the INFERIOR edge of the TP's largest CC
     to the SUPERIOR edge of the sacrum's largest CC in the same sagittal slice.
-
-    Both masks are (X, Z); display has z on the vertical axis.
-
-    Returns the gap in mm (inf if either mask is empty or sacrum is above TP).
+    Returns the gap in mm.
     """
     tp_lcc  = largest_cc_2d(tp_mask2d)
     sac_lcc = largest_cc_2d(sacrum_mask2d)
@@ -459,16 +472,13 @@ def _draw_gap_ruler(ax,
     if tp_zc.size == 0 or sac_zc.size == 0:
         return float('inf')
 
-    z_tp_inf  = int(tp_zc.min())    # inferior (low z) edge of TP
-    z_sac_sup = int(sac_zc.max())   # superior (high z) edge of sacrum
+    z_tp_inf  = int(tp_zc.min())
+    z_sac_sup = int(sac_zc.max())
 
-    # Sanity: sacrum should be inferior to TP (lower z in RAS canonical)
-    # If z_sac_sup >= z_tp_inf the structures overlap or order is reversed
     gap_mm = (z_tp_inf - z_sac_sup) * vox_z_mm
 
-    # x-position: between centroids of the two structures
-    tp_xc  = int(np.where(tp_lcc.any(axis=1))[0].mean())
-    sac_xc = int(np.where(sac_lcc.any(axis=1))[0].mean())
+    tp_xc   = int(np.where(tp_lcc.any(axis=1))[0].mean())
+    sac_xc  = int(np.where(sac_lcc.any(axis=1))[0].mean())
     x_ruler = (tp_xc + sac_xc) // 2
     tick    = max(3, int(tp_mask2d.shape[0] * 0.025))
 
@@ -480,7 +490,6 @@ def _draw_gap_ruler(ax,
                     color=color, lw=1.8, alpha=0.95)
         label_mm = f'{gap_mm:.1f} mm gap'
     else:
-        # Overlap: draw a short marker
         z_mid = (z_tp_inf + z_sac_sup) // 2
         ax.plot([x_ruler - tick, x_ruler + tick], [z_mid, z_mid],
                 color=color, lw=2.0, alpha=0.95)
@@ -496,28 +505,28 @@ def _draw_gap_ruler(ax,
 # ============================================================================
 
 def _panel_sag_tp_height(ax,
-                          sag_img:      Optional[np.ndarray],
-                          tp_l5_mask:   Optional[np.ndarray],
+                          sag_img:       Optional[np.ndarray],
+                          tp_l5_mask:    Optional[np.ndarray],
                           tp_other_mask: Optional[np.ndarray],
-                          sag_tss:      Optional[np.ndarray],
-                          side_name:    str,
-                          x_idx:        int,
-                          span_mm:      float,
-                          vox_z_mm:     float,
-                          z_tv_sag:     Optional[float],
-                          z_md_sag:     Optional[float],
-                          tv_name:      str):
-    """Row 0 — Type I check.  Yellow ruler spans the L5-only blob at best x."""
+                          sag_tss:       Optional[np.ndarray],
+                          side_name:     str,
+                          x_idx:         int,
+                          span_mm:       float,
+                          vox_z_mm:      float,
+                          z_axial_sag:   Optional[float],   # ONE line: axial z mapped to sag space
+                          tv_name:       str):
+    """
+    Row 0 — Type I check.
+    Single cyan reference line at the axial z shown in [0,2] (TP blob midpoint).
+    """
     color_this  = [1.00, 0.10, 0.10] if side_name == 'Left' else [0.00, 0.80, 1.00]
     color_other = [0.00, 0.80, 1.00] if side_name == 'Left' else [1.00, 0.10, 0.10]
 
     ax.imshow(norm(_sag_sl(sag_img, x_idx)).T, cmap='gray', origin='lower', alpha=0.80)
 
-    # Other side L5 blob — faint context
     if tp_other_mask is not None and tp_other_mask.any():
         overlay_mask(ax, _sag_sl(tp_other_mask, x_idx), color_other, 0.22)
 
-    # This side L5 blob — full brightness, ruler
     if tp_l5_mask is not None and tp_l5_mask.any():
         this_sl = _sag_sl(tp_l5_mask, x_idx)
         overlay_mask(ax, this_sl, color_this, 0.85)
@@ -527,15 +536,14 @@ def _panel_sag_tp_height(ax,
         overlay_mask(ax, _sag_sl(sag_tss == SACRUM_LABEL, x_idx),
                      [1.00, 0.55, 0.00], 0.45)
 
-    _hline(ax, z_tv_sag, LINE_TV,      label='TV mid')
-    _hline(ax, z_md_sag, LINE_MINDIST, label='min-dist')
+    # ONE reference line — the axial slice shown in [0,2]
+    _hline(ax, z_axial_sag, LINE_TV, label='axial slice →')
 
     ax.legend(handles=[
         mpatches.Patch(color=color_this,         label=f'{side_name} TP'),
         mpatches.Patch(color=color_other,        label=f'{"R" if side_name=="Left" else "L"} TP (faint)'),
         mpatches.Patch(color=[1.00, 0.55, 0.00], label='Sacrum'),
-        mpatches.Patch(color=LINE_TV,            label='TV mid'),
-        mpatches.Patch(color=LINE_MINDIST,       label='min-dist z'),
+        mpatches.Patch(color=LINE_TV,            label='axial slice'),
     ], loc='lower right', fontsize=6, framealpha=0.55)
 
     flag = '✓' if span_mm < TP_HEIGHT_MM else '✗ ≥19 mm → Type I'
@@ -567,7 +575,6 @@ def _panel_tss_axial_with_tps(ax,
                 overlay_mask(ax, m, color, 0.45)
                 patches.append(mpatches.Patch(color=color, label=name))
 
-    # Dilated TP projections — draw on top so they're visible
     if tp_left_sl is not None and tp_left_sl.any():
         tp_l_disp = dilate_for_display(tp_left_sl, DISPLAY_DILATION_VOXELS)
         overlay_mask(ax, tp_l_disp, [1.00, 0.10, 0.10], 0.80)
@@ -597,13 +604,11 @@ def _panel_sag_tp_proximity(ax,
                               x_idx:         int,
                               dist_mm:       float,
                               vox_z_mm:      float,
-                              z_tv_sag:      Optional[float],
-                              z_md_sag:      Optional[float],
+                              z_axial_sag:   Optional[float],   # ONE line: z_md shown in [1,2]
                               tv_name:       str):
     """
     Row 1 — Type II/III check.
-    sag_spineps is the L5-only TP boolean mask (already isolated).
-    Orange gap ruler between TP inferior edge and sacrum superior edge.
+    Single orange reference line at the axial z shown in [1,2] (min-dist slice).
     """
     color_this  = [1.00, 0.10, 0.10] if side_name == 'Left' else [0.00, 0.80, 1.00]
     color_other = [0.00, 0.80, 1.00] if side_name == 'Left' else [1.00, 0.10, 0.10]
@@ -620,18 +625,16 @@ def _panel_sag_tp_proximity(ax,
     if sag_tss is not None:
         overlay_mask(ax, sacrum_sl, [1.00, 0.55, 0.00], 0.60)
 
-    # Gap ruler: TP inferior edge → sacrum superior edge
     _draw_gap_ruler(ax, this_sl, sacrum_sl, vox_z_mm, color=LINE_MINDIST)
 
-    _hline(ax, z_tv_sag, LINE_TV,      label='TV mid')
-    _hline(ax, z_md_sag, LINE_MINDIST, label='closest approach')
+    # ONE reference line — the axial slice shown in [1,2]
+    _hline(ax, z_axial_sag, LINE_MINDIST, label='axial slice →')
 
     ax.legend(handles=[
         mpatches.Patch(color=color_this,         label=f'{side_name} TP'),
         mpatches.Patch(color=color_other,        label=f'{"R" if side_name=="Left" else "L"} TP (faint)'),
         mpatches.Patch(color=[1.00, 0.55, 0.00], label='Sacrum'),
-        mpatches.Patch(color=LINE_TV,            label='TV mid'),
-        mpatches.Patch(color=LINE_MINDIST,       label='closest approach'),
+        mpatches.Patch(color=LINE_MINDIST,       label='axial slice (min-dist)'),
     ], loc='lower right', fontsize=6, framealpha=0.55)
 
     dist_str = f'{dist_mm:.1f} mm' if np.isfinite(dist_mm) else 'N/A'
@@ -647,8 +650,7 @@ def _panel_sag_tss_confirm(ax,
                              sag_img_sl: np.ndarray,
                              tss_sag_sl: np.ndarray,
                              tv_name:    str,
-                             z_tv_sag:   Optional[float],
-                             z_md_sag:   Optional[float]):
+                             z_tv_sag:   Optional[float]):
     ax.imshow(norm(sag_img_sl).T, cmap='gray', origin='lower', alpha=0.80)
     patches = []
     for label, (color, name) in TSS_LABEL_COLORS.items():
@@ -660,8 +662,7 @@ def _panel_sag_tss_confirm(ax,
         patches.append(mpatches.Patch(color=color, label=name))
     if patches:
         ax.legend(handles=patches, loc='lower right', fontsize=6, framealpha=0.55)
-    _hline(ax, z_tv_sag, LINE_TV,      label='TV mid')
-    _hline(ax, z_md_sag, LINE_MINDIST, label='min-dist')
+    _hline(ax, z_tv_sag, LINE_TV, label='TV mid')
     ax.set_title(f'Sagittal TSS — Level Confirm  (TV={tv_name})\n'
                  'L5/L6 + Sacrum highlighted',
                  fontsize=10, color='white')
@@ -675,12 +676,10 @@ def _panel_axial_all_masks(ax,
                              z_idx:       int):
     """
     [2,1] — axial T2w with ALL TSS label colours + ALL SPINEPS masks overlaid.
-    Gives a complete combined view at TV mid.
     """
     ax.imshow(norm(img_sl).T, cmap='gray', origin='lower', alpha=0.75)
     patches = []
 
-    # TSS labels
     if tss_sl is not None:
         for label, (color, name) in TSS_LABEL_COLORS.items():
             m = tss_sl == label
@@ -688,7 +687,6 @@ def _panel_axial_all_masks(ax,
                 overlay_mask(ax, m, color, 0.40)
                 patches.append(mpatches.Patch(color=color, label=f'TSS {name}'))
 
-    # SPINEPS masks (dilated for visibility)
     if spineps_sl is not None:
         for label, (color, name) in SPINEPS_LABEL_COLORS.items():
             m = spineps_sl == label
@@ -759,10 +757,11 @@ def _panel_summary(ax,
         if result.get('errors'):
             lines += ['  Errors:'] + [f'    {e}' for e in result['errors']]
 
+    # Larger font for readability
     ax.text(0.05, 0.97, '\n'.join(lines),
             transform=ax.transAxes, va='top', ha='left',
-            fontsize=8.2, family='monospace', color='white', linespacing=1.35)
-    ax.set_title('Classification Summary', fontsize=11, color='white')
+            fontsize=10.5, family='monospace', color='white', linespacing=1.45)
+    ax.set_title('Classification Summary', fontsize=13, color='white')
 
 
 # ============================================================================
@@ -853,9 +852,6 @@ def visualize_study(
                 f"z_md_L={z_md_L}({dist_L:.1f}mm)  z_md_R={z_md_R}({dist_R:.1f}mm)")
 
     # ── Isolate L5-only TP blobs in sagittal space ───────────────────────────
-    # Use sacrum from orig_tss_sag as anatomical constraint
-    sac_sag_mask = ((orig_tss_sag == SACRUM_LABEL) if orig_tss_sag is not None
-                    else None)
     tp_l5_left_sag  = isolate_l5_tp_sag(orig_spineps, orig_tss_sag,
                                           TP_LEFT_LABEL,  tv_label)
     tp_l5_right_sag = isolate_l5_tp_sag(orig_spineps, orig_tss_sag,
@@ -871,18 +867,42 @@ def visualize_study(
     logger.info(f"  [{study_id}] x_left={x_left}({span_L:.1f}mm)  "
                 f"x_right={x_right}({span_R:.1f}mm)")
 
-    # ── Reference axial z for [0,2] ──────────────────────────────────────────
-    z_ref = (z_tv + z_md_combined) // 2
+    # ── Row 0 axial z: midpoint of the combined TP blobs in sagittal space ───
+    # Convert sagittal z-midpoint of each L5 TP blob to axial z
+    z_tp_mid_sag_L = tp_blob_z_midpoint(tp_l5_left_sag)
+    z_tp_mid_sag_R = tp_blob_z_midpoint(tp_l5_right_sag)
+    # Average the two midpoints (or use whichever exists)
+    if tp_l5_left_sag.any() and tp_l5_right_sag.any():
+        z_tp_mid_sag = (z_tp_mid_sag_L + z_tp_mid_sag_R) // 2
+    elif tp_l5_left_sag.any():
+        z_tp_mid_sag = z_tp_mid_sag_L
+    elif tp_l5_right_sag.any():
+        z_tp_mid_sag = z_tp_mid_sag_R
+    else:
+        z_tp_mid_sag = None
+
+    # Convert sag-space z to axial-space z for [0,2] slice
+    if z_tp_mid_sag is not None and sag_nii is not None:
+        z_row0_ax = sag_z_to_ax_z(sag_nii, ax_bg_nii, z_tp_mid_sag)
+    else:
+        z_row0_ax = z_tv  # fallback
+
+    if z_row0_ax is None:
+        z_row0_ax = z_tv
+
+    logger.info(f"  [{study_id}] z_tp_mid_sag={z_tp_mid_sag}  z_row0_ax={z_row0_ax}  z_md_combined={z_md_combined}")
 
     # ── Midline x for TSS confirm ─────────────────────────────────────────────
     x_mid = (orig_tss_sag.shape[0] // 2 if orig_tss_sag is not None
              else sag_bg.shape[0] // 2   if sag_bg       is not None else 0)
 
-    # ── Affine conversions ────────────────────────────────────────────────────
-    z_tv_sag   = ax_z_to_sag_z(ax_bg_nii, sag_nii, z_tv)
-    z_md_L_sag = ax_z_to_sag_z(ax_bg_nii, sag_nii, z_md_L)
-    z_md_R_sag = ax_z_to_sag_z(ax_bg_nii, sag_nii, z_md_R)
+    # ── Affine conversions for sagittal reference lines ───────────────────────
+    # Row 0 panels get ONE line: z_row0_ax in sag space
+    z_row0_sag = ax_z_to_sag_z(ax_bg_nii, sag_nii, z_row0_ax)
+    # Row 1 panels get ONE line: z_md_combined in sag space
     z_md_c_sag = ax_z_to_sag_z(ax_bg_nii, sag_nii, z_md_combined)
+    # TV mid for [2,0] confirm panel
+    z_tv_sag   = ax_z_to_sag_z(ax_bg_nii, sag_nii, z_tv)
 
     # ── TSS display volume ────────────────────────────────────────────────────
     tss_disp = tss_native if using_native else tss_reg
@@ -905,25 +925,27 @@ def visualize_study(
         _panel_sag_tp_height(
             axes[0, 0], sag_bg, tp_l5_left_sag, tp_l5_right_sag, orig_tss_sag,
             'Left', x_left, span_L, vox_sag[2],
-            z_tv_sag, z_md_L_sag, tv_name)
+            z_axial_sag=z_row0_sag,   # ONE line
+            tv_name=tv_name)
         _panel_sag_tp_height(
             axes[0, 1], sag_bg, tp_l5_right_sag, tp_l5_left_sag, orig_tss_sag,
             'Right', x_right, span_R, vox_sag[2],
-            z_tv_sag, z_md_R_sag, tv_name)
+            z_axial_sag=z_row0_sag,   # ONE line
+            tv_name=tv_name)
     else:
         _unavailable(axes[0, 0], 'Sagittal T2w not found')
         _unavailable(axes[0, 1], 'Sagittal T2w not found')
 
-    # [0,2] TSS labels + TP projections at z_ref
-    tss_sl_ref = _tss_axial_slice(ax_bg, tss_disp, z_ref)
+    # [0,2] TSS labels + TP projections at z_row0_ax (TP blob midpoint)
+    tss_sl_row0 = _tss_axial_slice(ax_bg, tss_disp, z_row0_ax)
     _panel_tss_axial_with_tps(
         axes[0, 2],
-        _ax_sl(ax_bg, z_ref),
-        tss_sl_ref,
-        _ax_sl(tp_left_ax,  z_ref),
-        _ax_sl(tp_right_ax, z_ref),
-        using_native, z_ref,
-        subtitle=f'z_ref = mean(z_tv={z_tv}, z_md={z_md_combined})',
+        _ax_sl(ax_bg, z_row0_ax),
+        tss_sl_row0,
+        _ax_sl(tp_left_ax,  z_row0_ax),
+        _ax_sl(tp_right_ax, z_row0_ax),
+        using_native, z_row0_ax,
+        subtitle=f'TP blob midpoint  z={z_row0_ax}',
     )
 
     # ── ROW 1 — Type II/III ──────────────────────────────────────────────────
@@ -932,11 +954,13 @@ def visualize_study(
         _panel_sag_tp_proximity(
             axes[1, 0], sag_bg, tp_l5_left_sag, tp_l5_right_sag, orig_tss_sag,
             'Left', x_left, dist_L, vox_sag[2],
-            z_tv_sag, z_md_L_sag, tv_name)
+            z_axial_sag=z_md_c_sag,   # ONE line
+            tv_name=tv_name)
         _panel_sag_tp_proximity(
             axes[1, 1], sag_bg, tp_l5_right_sag, tp_l5_left_sag, orig_tss_sag,
             'Right', x_right, dist_R, vox_sag[2],
-            z_tv_sag, z_md_R_sag, tv_name)
+            z_axial_sag=z_md_c_sag,   # ONE line
+            tv_name=tv_name)
     else:
         _unavailable(axes[1, 0], 'Sagittal T2w not found')
         _unavailable(axes[1, 1], 'Sagittal T2w not found')
@@ -957,13 +981,13 @@ def visualize_study(
 
     # ── ROW 2 — Context ───────────────────────────────────────────────────────
 
-    # [2,0] Sagittal TSS level confirm
+    # [2,0] Sagittal TSS level confirm — one line at TV mid
     if orig_tss_sag is not None:
         sag_bg_sl = (_sag_sl(sag_bg, x_mid) if sag_bg is not None
                      else _sag_sl(orig_tss_sag, x_mid).astype(float))
         _panel_sag_tss_confirm(
             axes[2, 0], sag_bg_sl, _sag_sl(orig_tss_sag, x_mid),
-            tv_name, z_tv_sag, z_md_c_sag)
+            tv_name, z_tv_sag)
     else:
         _unavailable(axes[2, 0], 'Sagittal TSS not found')
 
@@ -978,7 +1002,7 @@ def visualize_study(
         z_tv,
     )
 
-    # [2,2] Summary
+    # [2,2] Summary — larger font set inside _panel_summary
     _panel_summary(
         axes[2, 2], study_id, result, tv_name,
         span_left_mm=span_L, span_right_mm=span_R,
@@ -997,7 +1021,7 @@ def visualize_study(
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='LSTV Overlay Visualizer v8')
+    parser = argparse.ArgumentParser(description='LSTV Overlay Visualizer v9')
     parser.add_argument('--registered_dir',  required=True)
     parser.add_argument('--nifti_dir',       required=True)
     parser.add_argument('--spineps_dir',     required=True)
