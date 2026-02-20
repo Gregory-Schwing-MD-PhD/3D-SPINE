@@ -76,9 +76,10 @@ singularity exec \
     --pwd /work \
     "$IMG_PATH" \
     python3 -u /work/scripts/05_visualize_overlay.py \
-        --registered_dir /work/results/registered \
-        --nifti_dir      /work/results/nifti \
-        --output_dir     /work/results/lstv_viz \
+        --registered_dir  /work/results/registered \
+        --nifti_dir       /work/results/nifti \
+        --totalspine_dir  /work/results/totalspineseg \
+        --output_dir      /work/results/lstv_viz \
         ${STUDY_ID_ARG} \
         ${LSTV_JSON_ARG}
 
