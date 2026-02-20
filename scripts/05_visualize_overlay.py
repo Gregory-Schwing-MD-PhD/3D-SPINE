@@ -84,10 +84,14 @@ TSS_LABEL_COLORS = {
 # ============================================================================
 
 def load_canonical(path: Path) -> Tuple[np.ndarray, nib.Nifti1Image]:
-    """Load NIfTI and reorient to RAS canonical. axis2 = I-S."""
+    """Load NIfTI and reorient to RAS canonical. axis2 = I-S.
+    If 4D (e.g. shape X,Y,Z,1), take the first frame only."""
     nii = nib.load(str(path))
     nii = nib.as_closest_canonical(nii)
-    return nii.get_fdata(), nii
+    data = nii.get_fdata()
+    if data.ndim == 4:
+        data = data[..., 0]
+    return data, nii
 
 
 def voxel_size_mm(nii: nib.Nifti1Image) -> np.ndarray:
