@@ -78,6 +78,7 @@ singularity exec \
     python3 -u /work/scripts/05_visualize_overlay.py \
         --registered_dir  /work/results/registered \
         --nifti_dir       /work/results/nifti \
+        --spineps_dir     /work/results/spineps \
         --totalspine_dir  /work/results/totalspineseg \
         --output_dir      /work/results/lstv_viz \
         ${STUDY_ID_ARG} \
