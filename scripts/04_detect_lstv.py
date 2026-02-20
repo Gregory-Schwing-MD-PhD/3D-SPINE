@@ -1,64 +1,33 @@
 #!/usr/bin/env python3
 """
-LSTV Detector - Morphological Castellvi Classification
-with Probabilistic Uncertainty Integration
+04_detect_lstv.py — LSTV Morphological Castellvi Classifier
+============================================================
+Classifies lumbosacral transitional vertebrae using registered segmentations
+from 03b_register_to_axial.py. All volumes are in a common axial reference
+frame so no affine mapping is needed — distances are computed directly in
+world mm using the shared affine.
 
-Combines SPINEPS and TotalSpineSeg outputs to detect and classify
-lumbosacral transitional vertebrae (LSTV) using purely morphological
-criteria, assessed independently for each side (Left / Right).
+Input files per study (all in axial space after registration)
+-------------------------------------------------------------
+  registered_dir/{study_id}/{study_id}_spineps_reg.nii.gz
+    Labels:  43 = Left TP/costal process
+             44 = Right TP/costal process
+  registered_dir/{study_id}/{study_id}_tss_reg.nii.gz
+    Labels:  41-45 = L1-L5, 46 = L6, 50 = Sacrum
+  registered_dir/{study_id}/{study_id}_spineps_unc_reg.nii.gz
+  registered_dir/{study_id}/{study_id}_tss_unc_reg.nii.gz
 
-Input files per study_id
-------------------------
-SPINEPS:
-  spineps_dir/segmentations/{study_id}/{study_id}_seg-spine_msk.nii.gz
-    - Label 43: Left transverse / costal process
-    - Label 44: Right transverse / costal process
-  spineps_dir/segmentations/{study_id}/{study_id}_unc.nii.gz
-    - Normalised Shannon entropy [0, 1], float32
-
-TotalSpineSeg:
-  totalspine_dir/{study_id}/sagittal/{study_id}_sagittal_labeled.nii.gz
-    - Labels 41-45: L1-L5; 46: L6 (only in lumbarisation); 50: Sacrum
-    - Labels 91-100: intervertebral discs
-  totalspine_dir/{study_id}/sagittal/{study_id}_sagittal_unc.nii.gz
-    - Normalised Shannon entropy [0, 1], float32
-
-Classification logic (per side)
----------------------------------
-1.  Identify Target Vertebra (TV): L6 if label 46 present, else L5 (45).
-2.  Isolate TV-level TP voxels from SPINEPS using the TV's S-I z-range in
-    the TotalSpineSeg mask.
-3.  Measure S-I height of the isolated TP mask (mm).
-4.  Compute minimum distance between isolated TP mask and Sacrum mask.
-5.  Decision tree:
-      distance > 2.0 mm  ->  height > 19 mm  ->  Type I
-                         ->  height <= 19 mm  ->  Normal
-      distance <= 2.0 mm ->  extract uncertainty feature vector from
-                             contact zone and compute P(Type III)
-                             via logistic scoring.
-
-Uncertainty Feature Vector (contact zone)
--------------------------------------------
-Rather than a single mean uncertainty threshold, we extract:
-  - unc_mean      : mean entropy -> overall model confidence
-  - unc_std       : std dev -> heterogeneity (pseudo-arthrosis is patchy)
-  - unc_high_frac : fraction of voxels with unc > 0.3 -> extent of confusion
-
-Logistic scoring converts these to P(Type III | contact zone features):
-  - Low uniform uncertainty -> solid bone -> Type III (bony fusion)
-  - High or heterogeneous uncertainty -> fibrocartilage -> Type II
-
-Output JSON per study includes:
-  - castellvi_type    : hard classification
-  - confidence        : high / moderate / low
-  - p_type_ii / p_type_iii : calibrated probabilities (contact cases only)
-
-Usage:
-    python 04_detect_lstv.py \
-        --spineps_dir    results/spineps \
-        --totalspine_dir results/totalspineseg \
-        --output_dir     results/lstv_detection \
-        [--debug]
+Classification (per side)
+--------------------------
+1.  TV = L6 if present in TSS, else L5.
+2.  Isolate TP voxels at TV z-range (all in same grid now).
+3.  Measure TP S-I height (mm) from voxel size.
+4.  Measure TP-to-sacrum minimum distance (mm) via EDT in world space.
+5.  Decision:
+      dist > 2.0 mm, height > 19 mm  → Type I
+      dist > 2.0 mm, height ≤ 19 mm  → Normal
+      dist ≤ 2.0 mm                  → extract uncertainty features,
+                                        compute P(Type III) via logistic score
 """
 
 import argparse
@@ -84,12 +53,9 @@ logger = logging.getLogger(__name__)
 # CONSTANTS
 # ============================================================================
 
-LUMBAR_LABELS   = {41: 'L1', 42: 'L2', 43: 'L3', 44: 'L4', 45: 'L5', 46: 'L6'}
-DISC_LABELS     = {91: 'T12-L1', 92: 'L1-L2', 93: 'L2-L3', 94: 'L3-L4',
-                   95: 'L4-L5', 100: 'L5-S'}
-SACRUM_LABEL    = 50
 L5_LABEL        = 45
 L6_LABEL        = 46
+SACRUM_LABEL    = 50
 TP_LEFT_LABEL   = 43
 TP_RIGHT_LABEL  = 44
 
@@ -97,14 +63,11 @@ TP_HEIGHT_MM        = 19.0
 CONTACT_DIST_MM     = 2.0
 CONTACT_DILATION_MM = 3.0
 
-# Logistic scoring weights for P(Type III | contact zone features).
-# Negative weight = evidence AGAINST fusion (toward Type II).
-# Retrain with CalibratedClassifierCV once ground truth labels are available.
 LOGISTIC_INTERCEPT   =  0.5
-LOGISTIC_W_UNC_MEAN  = -5.0   # high mean entropy -> pseudo-arthrosis
-LOGISTIC_W_UNC_STD   = -3.0   # high heterogeneity -> irregular fibrocartilage
-LOGISTIC_W_UNC_HIGH  = -4.0   # many confused voxels -> no clean bone signal
-LOGISTIC_W_TP_HEIGHT =  1.0   # larger TP more likely to fuse completely
+LOGISTIC_W_UNC_MEAN  = -5.0
+LOGISTIC_W_UNC_STD   = -3.0
+LOGISTIC_W_UNC_HIGH  = -4.0
+LOGISTIC_W_TP_HEIGHT =  1.0
 
 CONF_HIGH_MARGIN     = 0.30
 CONF_MODERATE_MARGIN = 0.15
@@ -115,9 +78,13 @@ CONF_MODERATE_MARGIN = 0.15
 # ============================================================================
 
 def load_canonical(path: Path) -> Tuple[np.ndarray, nib.Nifti1Image]:
+    """Load NIfTI in RAS canonical orientation. Squeeze 4D → 3D."""
     nii = nib.load(str(path))
     nii = nib.as_closest_canonical(nii)
-    return nii.get_fdata(), nii
+    data = nii.get_fdata()
+    if data.ndim == 4:
+        data = data[..., 0]
+    return data, nii
 
 
 def voxel_size_mm(nii: nib.Nifti1Image) -> np.ndarray:
@@ -125,117 +92,103 @@ def voxel_size_mm(nii: nib.Nifti1Image) -> np.ndarray:
 
 
 # ============================================================================
-# MORPHOMETRICS
+# MORPHOMETRICS (all in shared axial space)
 # ============================================================================
 
-def get_tv_z_range(tss_data: np.ndarray, tv_label: int) -> Optional[Tuple[int, int]]:
-    tv_mask = tss_data == tv_label
-    if not tv_mask.any():
-        return None
-    z_coords = np.where(tv_mask)[2]
-    return int(z_coords.min()), int(z_coords.max())
-
-
-def isolate_tp_at_tv(spineps_data, tp_label, z_min, z_max):
-    tp_full = spineps_data == tp_label
-    z_max_safe = min(z_max, spineps_data.shape[2] - 1)
-    z_min_safe = max(z_min, 0)
-    isolated = np.zeros_like(tp_full)
-    isolated[:, :, z_min_safe:z_max_safe + 1] = tp_full[:, :, z_min_safe:z_max_safe + 1]
-    return isolated
-
-
-def measure_si_height_mm(mask, vox_mm):
+def get_tv_z_range(tss_data: np.ndarray,
+                   tv_label: int) -> Optional[Tuple[int, int]]:
+    mask = tss_data == tv_label
     if not mask.any():
+        return None
+    z = np.where(mask)[2]
+    return int(z.min()), int(z.max())
+
+
+def isolate_tp_at_tv(spineps_data: np.ndarray,
+                     tp_label: int,
+                     z_min: int, z_max: int) -> np.ndarray:
+    """Extract TP voxels within the TV z range (same grid — no mapping needed)."""
+    tp_full = spineps_data == tp_label
+    iso = np.zeros_like(tp_full)
+    z_lo = max(z_min, 0)
+    z_hi = min(z_max, spineps_data.shape[2] - 1)
+    iso[:, :, z_lo:z_hi + 1] = tp_full[:, :, z_lo:z_hi + 1]
+    return iso
+
+
+def measure_tp_height_mm(tp_mask: np.ndarray,
+                         vox_mm: np.ndarray) -> float:
+    """S-I extent of TP mask in mm (axis 2 = I-S in RAS canonical)."""
+    if not tp_mask.any():
         return 0.0
-    z_coords = np.where(mask)[2]
-    return float((z_coords.max() - z_coords.min()) * vox_mm[2])
+    z = np.where(tp_mask)[2]
+    return float((z.max() - z.min() + 1) * vox_mm[2])
 
 
-def min_distance_mm(mask_a, mask_b, vox_mm):
+def measure_min_dist_mm(mask_a: np.ndarray,
+                        mask_b: np.ndarray,
+                        vox_mm: np.ndarray) -> float:
+    """
+    Minimum Euclidean distance (mm) between two binary masks.
+    Uses EDT on mask_b with voxel spacing, then samples at mask_a locations.
+    """
     if not mask_a.any() or not mask_b.any():
         return float('inf')
-    dist_from_b = distance_transform_edt(~mask_b, sampling=vox_mm)
-    return float(dist_from_b[mask_a].min())
+    edt = distance_transform_edt(~mask_b, sampling=vox_mm)
+    return float(edt[mask_a].min())
 
 
-def build_contact_zone(mask_a, mask_b, vox_mm, radius_mm):
+# ============================================================================
+# UNCERTAINTY FEATURES
+# ============================================================================
+
+def build_contact_zone(mask_a: np.ndarray,
+                       mask_b: np.ndarray,
+                       vox_mm: np.ndarray,
+                       radius_mm: float) -> np.ndarray:
     radius_vox = np.maximum(np.round(radius_mm / vox_mm).astype(int), 1)
     struct = np.ones(2 * radius_vox + 1, dtype=bool)
-    return binary_dilation(mask_a, structure=struct) & binary_dilation(mask_b, structure=struct)
+    return (binary_dilation(mask_a, structure=struct) &
+            binary_dilation(mask_b, structure=struct))
 
 
-# ============================================================================
-# UNCERTAINTY FEATURE EXTRACTION
-# ============================================================================
-
-def extract_uncertainty_features(unc_data, zone_mask, high_thresh=0.30):
-    """
-    Extract a feature vector from uncertainty map within zone_mask.
-
-    unc_mean      : mean entropy — overall model confidence in the zone
-    unc_std       : std dev — heterogeneity; pseudo-arthrosis is patchy,
-                    bony fusion is uniform
-    unc_high_frac : fraction of voxels with unc > high_thresh — extent
-                    of model confusion; higher = more tissue ambiguity
-    n_voxels      : zone size
-    valid         : False if zone empty or all-NaN
-    """
-    vals = unc_data[zone_mask]
-    vals = vals[~np.isnan(vals)]
-    if vals.size == 0:
-        return {'unc_mean': float('nan'), 'unc_std': float('nan'),
-                'unc_high_frac': float('nan'), 'n_voxels': 0, 'valid': False}
-    return {
-        'unc_mean':      float(np.mean(vals)),
-        'unc_std':       float(np.std(vals)),
-        'unc_high_frac': float(np.mean(vals > high_thresh)),
-        'n_voxels':      int(vals.size),
-        'valid':         True,
+def extract_uncertainty_features(
+    unc_map: Optional[np.ndarray],
+    contact_zone: np.ndarray,
+    source_label: str,
+) -> dict:
+    base = {
+        'unc_mean':      None,
+        'unc_std':       None,
+        'unc_high_frac': None,
+        'n_voxels':      0,
+        'valid':         False,
+        'source':        source_label,
     }
+    if unc_map is None or not contact_zone.any():
+        return base
+    vals = unc_map[contact_zone]
+    vals = vals[np.isfinite(vals)]
+    if len(vals) == 0:
+        return base
+    base['unc_mean']      = float(np.mean(vals))
+    base['unc_std']       = float(np.std(vals))
+    base['unc_high_frac'] = float(np.mean(vals > 0.3))
+    base['n_voxels']      = int(len(vals))
+    base['valid']         = True
+    return base
 
 
-def merge_uncertainty_features(features_tss, features_spineps):
-    """TSS is primary; SPINEPS fills in as fallback."""
-    if features_tss.get('valid'):
-        merged = dict(features_tss)
-        merged['source'] = 'tss'
-    elif features_spineps.get('valid'):
-        merged = dict(features_spineps)
-        merged['source'] = 'spineps'
-    else:
-        merged = {'unc_mean': float('nan'), 'unc_std': float('nan'),
-                  'unc_high_frac': float('nan'), 'n_voxels': 0,
-                  'valid': False, 'source': 'none'}
-    return merged
+def sigmoid(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-max(-500.0, min(500.0, x))))
 
 
-# ============================================================================
-# PROBABILISTIC TYPE II vs III
-# ============================================================================
-
-def _sigmoid(x):
-    if x >= 0:
-        return 1.0 / (1.0 + math.exp(-x))
-    e = math.exp(x)
-    return e / (1.0 + e)
-
-
-def compute_p_type_iii(unc_mean, unc_std, unc_high_frac, tp_height_mm):
-    """
-    P(Type III bony fusion | contact zone features) via logistic scoring.
-
-    Returns probability in [0,1]:
-      -> 1.0: very likely solid bony fusion (Type III)
-      -> 0.0: very likely pseudo-arthrosis (Type II)
-
-    NaN features are replaced with maximally uncertain values (conservative,
-    biases toward Type II which is the safer default for missed fusion).
-    """
-    if math.isnan(unc_mean):      unc_mean = 0.5
-    if math.isnan(unc_std):       unc_std = 0.3
-    if math.isnan(unc_high_frac): unc_high_frac = 0.5
-
+def compute_p_type_iii(
+    unc_mean: float,
+    unc_std: float,
+    unc_high_frac: float,
+    tp_height_mm: float,
+) -> float:
     score = (
         LOGISTIC_INTERCEPT
         + LOGISTIC_W_UNC_MEAN  * unc_mean
@@ -243,57 +196,34 @@ def compute_p_type_iii(unc_mean, unc_std, unc_high_frac, tp_height_mm):
         + LOGISTIC_W_UNC_HIGH  * unc_high_frac
         + LOGISTIC_W_TP_HEIGHT * (tp_height_mm / 30.0)
     )
-    return _sigmoid(score)
+    return sigmoid(score)
 
 
-def probability_to_confidence(p_type_iii):
+def probability_to_confidence(p_type_iii: float) -> str:
     margin = abs(p_type_iii - 0.5)
-    if margin > CONF_HIGH_MARGIN:     return 'high'
-    if margin > CONF_MODERATE_MARGIN: return 'moderate'
+    if margin > CONF_HIGH_MARGIN:
+        return 'high'
+    if margin > CONF_MODERATE_MARGIN:
+        return 'moderate'
     return 'low'
-
-
-def classify_contact_zone(unc_features, tp_height_mm):
-    """
-    Given uncertainty features for a confirmed TP-sacrum contact case,
-    return classification, probabilities, and confidence.
-    """
-    if not unc_features.get('valid'):
-        return {
-            'classification': 'Type II',
-            'p_type_ii':      0.65,
-            'p_type_iii':     0.35,
-            'confidence':     'low',
-            'unc_features':   unc_features,
-            'note':           'No uncertainty data; conservatively defaulted to Type II',
-        }
-
-    p3 = compute_p_type_iii(
-        unc_mean      = unc_features['unc_mean'],
-        unc_std       = unc_features['unc_std'],
-        unc_high_frac = unc_features['unc_high_frac'],
-        tp_height_mm  = tp_height_mm,
-    )
-    p2 = 1.0 - p3
-
-    return {
-        'classification': 'Type III' if p3 >= 0.5 else 'Type II',
-        'p_type_ii':      round(p2, 4),
-        'p_type_iii':     round(p3, 4),
-        'confidence':     probability_to_confidence(p3),
-        'unc_features':   {k: round(v, 4) if isinstance(v, float) else v
-                           for k, v in unc_features.items()},
-    }
 
 
 # ============================================================================
 # PER-SIDE CLASSIFICATION
 # ============================================================================
 
-def classify_side(tp_isolated, sacrum_mask, spineps_unc, tss_unc,
-                  vox_mm_spineps, vox_mm_tss, debug):
+def classify_side(
+    side: str,
+    tp_label: int,
+    spineps_data: np.ndarray,
+    tss_data: np.ndarray,
+    vox_mm: np.ndarray,
+    tv_z_range: Tuple[int, int],
+    spineps_unc: Optional[np.ndarray],
+    tss_unc: Optional[np.ndarray],
+) -> dict:
     result = {
-        'tp_present':    bool(tp_isolated.any()),
+        'tp_present':    False,
         'tp_height_mm':  0.0,
         'contact':       False,
         'dist_mm':       float('inf'),
@@ -301,329 +231,276 @@ def classify_side(tp_isolated, sacrum_mask, spineps_unc, tss_unc,
         'p_type_iii':    None,
         'confidence':    None,
         'unc_features':  None,
-        'classification':'Normal',
+        'classification': 'Normal',
     }
 
-    if not tp_isolated.any():
+    z_min, z_max = tv_z_range
+    tp_mask = isolate_tp_at_tv(spineps_data, tp_label, z_min, z_max)
+
+    if not tp_mask.any():
+        result['note'] = 'TP label absent at TV level'
         return result
 
-    height_mm = measure_si_height_mm(tp_isolated, vox_mm_spineps)
-    result['tp_height_mm'] = round(height_mm, 2)
+    result['tp_present']   = True
+    result['tp_height_mm'] = measure_tp_height_mm(tp_mask, vox_mm)
 
+    sacrum_mask = tss_data == SACRUM_LABEL
     if not sacrum_mask.any():
-        result['dist_mm'] = float('inf')
-        result['classification'] = 'Type I' if height_mm > TP_HEIGHT_MM else 'Normal'
+        result['note'] = 'Sacrum label absent'
         return result
 
-    dist_mm = min_distance_mm(tp_isolated, sacrum_mask, vox_mm_tss)
-    result['dist_mm'] = round(dist_mm, 2)
-    result['contact'] = dist_mm <= CONTACT_DIST_MM
+    dist = measure_min_dist_mm(tp_mask, sacrum_mask, vox_mm)
+    result['dist_mm'] = round(dist, 2)
 
-    if not result['contact']:
-        result['classification'] = 'Type I' if height_mm > TP_HEIGHT_MM else 'Normal'
+    # --- Type I: no contact, but enlarged TP ---------------------------------
+    if dist > CONTACT_DIST_MM:
+        if result['tp_height_mm'] > TP_HEIGHT_MM:
+            result['classification'] = 'Type I'
         return result
 
-    # --- Contact case: probabilistic Type II vs III ---
-    contact_zone = build_contact_zone(
-        tp_isolated, sacrum_mask, vox_mm_tss, CONTACT_DILATION_MM
-    )
+    # --- Contact: Type II vs III via uncertainty features --------------------
+    result['contact'] = True
+    contact_zone = build_contact_zone(tp_mask, sacrum_mask, vox_mm, CONTACT_DILATION_MM)
 
-    features_tss     = extract_uncertainty_features(tss_unc, contact_zone)
-    features_spineps = extract_uncertainty_features(spineps_unc, contact_zone)
-    merged           = merge_uncertainty_features(features_tss, features_spineps)
+    # Prefer TSS uncertainty (higher resolution), fall back to SPINEPS
+    unc_features = extract_uncertainty_features(tss_unc, contact_zone, 'tss')
+    if not unc_features['valid']:
+        unc_features = extract_uncertainty_features(spineps_unc, contact_zone, 'spineps')
 
-    if debug:
-        merged['tss_features']     = features_tss
-        merged['spineps_features'] = features_spineps
+    result['unc_features'] = unc_features
 
-    cr = classify_contact_zone(merged, height_mm)
-
-    result['classification'] = cr['classification']
-    result['p_type_ii']      = cr['p_type_ii']
-    result['p_type_iii']     = cr['p_type_iii']
-    result['confidence']     = cr['confidence']
-    result['unc_features']   = cr['unc_features']
-    if 'note' in cr:
-        result['note'] = cr['note']
+    if unc_features['valid']:
+        p3 = compute_p_type_iii(
+            unc_features['unc_mean'],
+            unc_features['unc_std'],
+            unc_features['unc_high_frac'],
+            result['tp_height_mm'],
+        )
+        result['p_type_iii']  = round(p3, 4)
+        result['p_type_ii']   = round(1.0 - p3, 4)
+        result['confidence']  = probability_to_confidence(p3)
+        result['classification'] = 'Type III' if p3 >= 0.5 else 'Type II'
+    else:
+        # No uncertainty available — default to Type II (pseudo-arthrosis)
+        result['classification'] = 'Type II'
+        result['note'] = 'No uncertainty map — defaulted to Type II'
 
     return result
 
 
 # ============================================================================
-# CASTELLVI ASSEMBLY
+# PER-STUDY
 # ============================================================================
 
-CASTELLVI_TABLE = {
-    ('Normal',  'Normal'):   None,
-    ('Type I',  'Normal'):   'Type I',
-    ('Normal',  'Type I'):   'Type I',
-    ('Type I',  'Type I'):   'Type I',
-    ('Type II', 'Normal'):   'Type II',
-    ('Normal',  'Type II'):  'Type II',
-    ('Type II', 'Type II'):  'Type II',
-    ('Type III','Normal'):   'Type III',
-    ('Normal',  'Type III'): 'Type III',
-    ('Type III','Type III'): 'Type III',
-    ('Type II', 'Type III'): 'Type IV',
-    ('Type III','Type II'):  'Type IV',
-    ('Type I',  'Type II'):  'Type II',
-    ('Type II', 'Type I'):   'Type II',
-    ('Type I',  'Type III'): 'Type III',
-    ('Type III','Type I'):   'Type III',
-}
+def classify_study(
+    study_id: str,
+    registered_dir: Path,
+) -> dict:
+    out = {
+        'study_id':       study_id,
+        'lstv_detected':  False,
+        'castellvi_type': None,
+        'confidence':     'high',
+        'left':           {},
+        'right':          {},
+        'details':        {},
+        'errors':         [],
+    }
 
+    reg = registered_dir / study_id
 
-def assemble_castellvi(left_cls, right_cls):
-    return CASTELLVI_TABLE.get((left_cls, right_cls), None)
-
-
-def assemble_overall_confidence(left, right):
-    rank = {'high': 2, 'moderate': 1, 'low': 0}
-    scores = [rank[s['confidence']] for s in (left, right)
-              if s.get('contact') and s.get('confidence')]
-    if not scores:
-        return 'high'
-    return {2: 'high', 1: 'moderate', 0: 'low'}[min(scores)]
-
-
-# ============================================================================
-# DETECTOR
-# ============================================================================
-
-class LSTVDetector:
-    def __init__(self, spineps_dir, totalspine_dir, debug=False):
-        self.spineps_dir    = Path(spineps_dir)
-        self.totalspine_dir = Path(totalspine_dir)
-        self.debug          = debug
-
-    def _spineps_mask(self, sid):
-        return self.spineps_dir / 'segmentations' / sid / f"{sid}_seg-spine_msk.nii.gz"
-
-    def _spineps_unc(self, sid):
-        return self.spineps_dir / 'segmentations' / sid / f"{sid}_unc.nii.gz"
-
-    def _tss_mask(self, sid):
-        return self.totalspine_dir / sid / 'sagittal' / f"{sid}_sagittal_labeled.nii.gz"
-
-    def _tss_unc(self, sid):
-        return self.totalspine_dir / sid / 'sagittal' / f"{sid}_sagittal_unc.nii.gz"
-
-    def _load_unc(self, path, ref_shape):
-        """Load uncertainty map, returning NaN array if missing or unreadable."""
-        if path.exists():
-            try:
-                data, _ = load_canonical(path)
-                return data.astype(np.float32)
-            except Exception as e:
-                logger.warning(f"  Could not load uncertainty map {path}: {e}")
-        else:
-            logger.warning(f"  Uncertainty map not found: {path}")
-        return np.full(ref_shape, float('nan'), dtype=np.float32)
-
-    def classify_study(self, study_id):
-        result = {
-            'study_id':       study_id,
-            'lstv_detected':  False,
-            'castellvi_type': None,
-            'confidence':     None,
-            'left':           {},
-            'right':          {},
-            'details':        {},
-            'errors':         [],
-        }
-
-        # TSS mask (required)
-        tss_mask_path = self._tss_mask(study_id)
-        if not tss_mask_path.exists():
-            result['errors'].append(f"TSS mask not found: {tss_mask_path}")
-            return result
+    def load(name, label):
+        p = reg / f"{study_id}_{name}"
+        if not p.exists():
+            logger.warning(f"  [{study_id}] Missing: {p.name}")
+            return None, None
         try:
-            tss_data, tss_nii = load_canonical(tss_mask_path)
-            tss_data = tss_data.astype(int)
+            return load_canonical(p)
         except Exception as e:
-            result['errors'].append(f"Failed to load TSS mask: {e}")
-            return result
-        vox_tss = voxel_size_mm(tss_nii)
+            logger.warning(f"  [{study_id}] Cannot load {label}: {e}")
+            return None, None
 
-        # SPINEPS mask (required)
-        spineps_mask_path = self._spineps_mask(study_id)
-        if not spineps_mask_path.exists():
-            result['errors'].append(f"SPINEPS mask not found: {spineps_mask_path}")
-            return result
+    spineps_data, spineps_nii = load('spineps_reg.nii.gz',     'SPINEPS seg')
+    tss_data,     tss_nii     = load('tss_reg.nii.gz',         'TSS seg')
+    spineps_unc,  _           = load('spineps_unc_reg.nii.gz', 'SPINEPS unc')
+    tss_unc,      _           = load('tss_unc_reg.nii.gz',     'TSS unc')
+
+    if spineps_data is None or tss_data is None:
+        out['errors'].append('Missing required segmentation(s)')
+        return out
+
+    spineps_data = spineps_data.astype(int)
+    tss_data     = tss_data.astype(int)
+    vox_mm       = voxel_size_mm(spineps_nii)  # both on same grid now
+
+    # Target vertebra
+    has_l6   = L6_LABEL in np.unique(tss_data)
+    tv_label = L6_LABEL if has_l6 else L5_LABEL
+    tv_name  = 'L6' if has_l6 else 'L5'
+
+    tv_z_range = get_tv_z_range(tss_data, tv_label)
+    if tv_z_range is None:
+        out['errors'].append(f'TV label {tv_name} not found in TSS segmentation')
+        return out
+
+    sacrum_present = (SACRUM_LABEL in np.unique(tss_data))
+
+    out['details'] = {
+        'tv_label':      tv_label,
+        'tv_name':       tv_name,
+        'has_l6':        has_l6,
+        'sacrum_present': sacrum_present,
+        'tv_z_range':    list(tv_z_range),
+    }
+
+    # Classify each side
+    for side, tp_label in (('left', TP_LEFT_LABEL), ('right', TP_RIGHT_LABEL)):
         try:
-            spineps_data, spineps_nii = load_canonical(spineps_mask_path)
-            spineps_data = spineps_data.astype(int)
-        except Exception as e:
-            result['errors'].append(f"Failed to load SPINEPS mask: {e}")
-            return result
-        vox_spineps = voxel_size_mm(spineps_nii)
-
-        # Uncertainty maps (optional — NaN array if missing)
-        tss_unc_data     = self._load_unc(self._tss_unc(study_id),     tss_data.shape)
-        spineps_unc_data = self._load_unc(self._spineps_unc(study_id), spineps_data.shape)
-
-        # Target vertebra
-        unique_labels = set(np.unique(tss_data).tolist())
-        tv_label = L6_LABEL if L6_LABEL in unique_labels else L5_LABEL
-        result['details'].update({
-            'tv_label':       tv_label,
-            'tv_name':        LUMBAR_LABELS.get(tv_label, '?'),
-            'has_l6':         L6_LABEL in unique_labels,
-            'sacrum_present': SACRUM_LABEL in unique_labels,
-        })
-
-        tv_z_range = get_tv_z_range(tss_data, tv_label)
-        if tv_z_range is None:
-            result['errors'].append(f"TV label {tv_label} not found in TSS mask")
-            return result
-        z_min, z_max = tv_z_range
-        result['details']['tv_z_range'] = [z_min, z_max]
-
-        sacrum_mask = (tss_data == SACRUM_LABEL)
-
-        # Per-side
-        for side, tp_label in [('left', TP_LEFT_LABEL), ('right', TP_RIGHT_LABEL)]:
-            tp_isolated = isolate_tp_at_tv(spineps_data, tp_label, z_min, z_max)
-            side_result = classify_side(
-                tp_isolated    = tp_isolated,
-                sacrum_mask    = sacrum_mask,
-                spineps_unc    = spineps_unc_data,
-                tss_unc        = tss_unc_data,
-                vox_mm_spineps = vox_spineps,
-                vox_mm_tss     = vox_tss,
-                debug          = self.debug,
+            r = classify_side(
+                side, tp_label,
+                spineps_data, tss_data, vox_mm, tv_z_range,
+                spineps_unc if spineps_unc is not None else None,
+                tss_unc     if tss_unc     is not None else None,
             )
-            result[side] = side_result
-
-            prob_str = ''
-            if side_result.get('p_type_iii') is not None:
-                prob_str = (f"  P(II)={side_result['p_type_ii']:.2f}"
-                            f"  P(III)={side_result['p_type_iii']:.2f}"
-                            f"  [{side_result['confidence']}]")
+            out[side] = r
             logger.info(
-                f"  [{study_id}] {side:5s}: {side_result['classification']:8s}"
-                f"  h={side_result['tp_height_mm']:.1f}mm"
-                f"  d={side_result['dist_mm']:.1f}mm"
-                + prob_str
+                f"  [{study_id}] {side:5s}: {r['classification']:8s}"
+                f"  h={r['tp_height_mm']:.1f}mm  d={r['dist_mm']:.1f}mm"
+            )
+        except Exception as e:
+            out['errors'].append(f'{side}: {e}')
+            logger.error(f"  [{study_id}] {side} failed: {e}")
+
+    # Overall Castellvi type
+    types = {
+        out.get('left',  {}).get('classification'),
+        out.get('right', {}).get('classification'),
+    }
+    types.discard(None)
+    types.discard('Normal')
+
+    if not types:
+        logger.info(f"  [{study_id}] ✗ No LSTV detected")
+    else:
+        out['lstv_detected'] = True
+        # Bilateral → Type IV; unilateral → use the positive side
+        if len(types) == 2 and types != {'Type I'} and types != {'Type I', 'Normal'}:
+            left_cls  = out.get('left',  {}).get('classification', 'Normal')
+            right_cls = out.get('right', {}).get('classification', 'Normal')
+            if left_cls != 'Normal' and right_cls != 'Normal':
+                out['castellvi_type'] = 'Type IV'
+            else:
+                out['castellvi_type'] = next(
+                    c for c in (left_cls, right_cls) if c != 'Normal'
+                )
+        else:
+            out['castellvi_type'] = max(
+                types,
+                key=lambda t: {'Type I': 1, 'Type II': 2,
+                               'Type III': 3, 'Type IV': 4}.get(t, 0)
             )
 
-        # Final assembly
-        left_cls  = result['left'].get('classification', 'Normal')
-        right_cls = result['right'].get('classification', 'Normal')
-        final     = assemble_castellvi(left_cls, right_cls)
+        # Overall confidence = minimum of both sides
+        conf_order = {'high': 3, 'moderate': 2, 'low': 1, None: 3}
+        left_conf  = out.get('left',  {}).get('confidence')
+        right_conf = out.get('right', {}).get('confidence')
+        out['confidence'] = min(
+            (left_conf, right_conf),
+            key=lambda c: conf_order.get(c, 3)
+        ) or 'high'
 
-        result['castellvi_type'] = final
-        result['lstv_detected']  = final is not None
-        result['confidence']     = assemble_overall_confidence(result['left'], result['right'])
+        logger.info(f"  [{study_id}] ✓ LSTV: {out['castellvi_type']} ({out['confidence']})")
 
-        return result
-
-    def detect_all_studies(self, output_dir):
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        spineps_seg_dir = self.spineps_dir / 'segmentations'
-        if not spineps_seg_dir.exists():
-            logger.error(f"SPINEPS segmentation dir not found: {spineps_seg_dir}")
-            return []
-
-        study_dirs  = sorted([d for d in spineps_seg_dir.iterdir() if d.is_dir()])
-        results     = []
-        lstv_count  = 0
-        error_count = 0
-        low_conf    = 0
-
-        logger.info(f"Found {len(study_dirs)} studies to process")
-
-        for study_dir in study_dirs:
-            study_id = study_dir.name
-            logger.info(f"\n[{study_id}]")
-            try:
-                r = self.classify_study(study_id)
-                results.append(r)
-                if r['errors']:
-                    error_count += 1
-                    for err in r['errors']:
-                        logger.warning(f"  ⚠  {err}")
-                if r['lstv_detected']:
-                    lstv_count += 1
-                    logger.info(f"  ✓ LSTV: {r['castellvi_type']}  (confidence: {r['confidence']})")
-                else:
-                    logger.info(f"  ✗ No LSTV detected")
-                if r.get('confidence') == 'low':
-                    low_conf += 1
-            except Exception as e:
-                logger.error(f"  Unhandled error for {study_id}: {e}")
-                logger.debug(traceback.format_exc())
-                results.append({'study_id': study_id, 'lstv_detected': False,
-                                 'castellvi_type': None, 'confidence': None, 'errors': [str(e)]})
-                error_count += 1
-
-        results_file = output_dir / 'lstv_results.json'
-        with open(results_file, 'w') as f:
-            json.dump(results, f, indent=2)
-
-        breakdown = {t: 0 for t in ('Type I', 'Type II', 'Type III', 'Type IV')}
-        for r in results:
-            if r.get('castellvi_type') in breakdown:
-                breakdown[r['castellvi_type']] += 1
-
-        summary = {
-            'total_studies':        len(results),
-            'lstv_detected':        lstv_count,
-            'lstv_rate':            lstv_count / len(results) if results else 0.0,
-            'error_count':          error_count,
-            'low_confidence_cases': low_conf,
-            'castellvi_breakdown':  breakdown,
-            'note': (
-                'Type II/III probabilities use a logistic scoring function with '
-                'clinically-grounded priors. Replace with CalibratedClassifierCV '
-                'once ground truth Castellvi labels are available.'
-            ),
-        }
-
-        summary_file = output_dir / 'lstv_summary.json'
-        with open(summary_file, 'w') as f:
-            json.dump(summary, f, indent=2)
-
-        logger.info("\n" + "=" * 70)
-        logger.info("LSTV DETECTION SUMMARY")
-        logger.info("=" * 70)
-        logger.info(f"Total studies:         {summary['total_studies']}")
-        logger.info(f"LSTV detected:         {summary['lstv_detected']} ({summary['lstv_rate']:.1%})")
-        logger.info(f"Errors / incomplete:   {summary['error_count']}")
-        logger.info(f"Low confidence cases:  {summary['low_confidence_cases']}")
-        logger.info("")
-        logger.info("Castellvi Breakdown:")
-        for t, c in summary['castellvi_breakdown'].items():
-            logger.info(f"  {t}: {c}")
-        logger.info(f"\nResults -> {results_file}")
-        logger.info(f"Summary -> {summary_file}")
-
-        return results
+    return out
 
 
 # ============================================================================
-# ENTRY POINT
+# MAIN
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Morphological LSTV Detection and Castellvi Classification'
-    )
-    parser.add_argument('--spineps_dir',    required=True)
-    parser.add_argument('--totalspine_dir', required=True)
+    parser = argparse.ArgumentParser(description='LSTV Castellvi Classifier')
+    parser.add_argument('--registered_dir', required=True,
+                        help='Output of 03b_register_to_axial.py')
     parser.add_argument('--output_dir',     required=True)
-    parser.add_argument('--debug', action='store_true',
-                        help='Include full uncertainty feature vectors and per-model '
-                             'breakdown in JSON output for threshold analysis.')
+    parser.add_argument('--study_id',       default=None,
+                        help='Single study (omit for batch)')
+    parser.add_argument('--mode',           default='prod',
+                        choices=['trial', 'prod'])
     args = parser.parse_args()
 
-    LSTVDetector(
-        spineps_dir    = args.spineps_dir,
-        totalspine_dir = args.totalspine_dir,
-        debug          = args.debug,
-    ).detect_all_studies(args.output_dir)
+    registered_dir = Path(args.registered_dir)
+    output_dir     = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.study_id:
+        study_ids = [args.study_id]
+    else:
+        study_ids = sorted(d.name for d in registered_dir.iterdir() if d.is_dir())
+        if args.mode == 'trial':
+            study_ids = study_ids[:5]
+
+    logger.info(f"Found {len(study_ids)} studies to process")
+
+    results = []
+    errors  = 0
+    low_conf = 0
+    castellvi_counts = {'Type I': 0, 'Type II': 0, 'Type III': 0, 'Type IV': 0}
+
+    for sid in study_ids:
+        logger.info(f"\n[{sid}]")
+        try:
+            r = classify_study(sid, registered_dir)
+            results.append(r)
+            if r.get('errors'):
+                errors += 1
+            if r.get('confidence') == 'low':
+                low_conf += 1
+            ct = r.get('castellvi_type')
+            if ct in castellvi_counts:
+                castellvi_counts[ct] += 1
+        except Exception as e:
+            logger.error(f"  [{sid}] Unhandled: {e}")
+            logger.debug(traceback.format_exc())
+            errors += 1
+
+    lstv_n = sum(1 for r in results if r.get('lstv_detected'))
+
+    logger.info('\n' + '=' * 70)
+    logger.info('LSTV DETECTION SUMMARY')
+    logger.info('=' * 70)
+    logger.info(f"Total studies:         {len(results)}")
+    logger.info(f"LSTV detected:         {lstv_n} ({100*lstv_n/max(len(results),1):.1f}%)")
+    logger.info(f"Errors / incomplete:   {errors}")
+    logger.info(f"Low confidence cases:  {low_conf}")
+    logger.info('')
+    logger.info('Castellvi Breakdown:')
+    for t, n in castellvi_counts.items():
+        logger.info(f"  {t}: {n}")
+
+    results_path = output_dir / 'lstv_results.json'
+    with open(results_path, 'w') as f:
+        json.dump(results, f, indent=2, default=str)
+    logger.info(f"\nResults -> {results_path}")
+
+    summary = {
+        'total_studies':        len(results),
+        'lstv_detected':        lstv_n,
+        'lstv_rate':            round(lstv_n / max(len(results), 1), 4),
+        'error_count':          errors,
+        'low_confidence_cases': low_conf,
+        'castellvi_breakdown':  castellvi_counts,
+        'note': (
+            'All measurements in registered axial space. '
+            'Type II/III probabilities use a logistic scoring function with '
+            'clinically-grounded priors. Replace with CalibratedClassifierCV '
+            'once ground truth Castellvi labels are available.'
+        ),
+    }
+    summary_path = output_dir / 'lstv_summary.json'
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+    logger.info(f"Summary -> {summary_path}")
 
 
 if __name__ == '__main__':

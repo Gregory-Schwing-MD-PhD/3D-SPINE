@@ -1,24 +1,27 @@
 #!/bin/bash
-#SBATCH -q primary
+#SBATCH -q standard
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=2
-#SBATCH --mem=16G
-#SBATCH --time=2:00:00
-#SBATCH --job-name=lstv_viz
-#SBATCH -o logs/lstv_viz_%j.out
-#SBATCH -e logs/lstv_viz_%j.err
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
+#SBATCH --time=12:00:00
+#SBATCH --job-name=register_axial
+#SBATCH -o logs/register_%j.out
+#SBATCH -e logs/register_%j.err
 #SBATCH --mail-user=go2432@wayne.edu
 #SBATCH --mail-type=BEGIN,END,FAIL
 
 set -euo pipefail
 
+MODE="${MODE:-prod}"
+RETRY_FAILED="${RETRY_FAILED:-false}"
 STUDY_ID="${STUDY_ID:-}"
 
 echo "================================================================"
-echo "LSTV VISUALIZATION (registered space)"
-echo "Job ID: $SLURM_JOB_ID"
-echo "Start:  $(date)"
+echo "REGISTER SAG -> AXIAL SPACE"
+echo "Mode:  $MODE"
+echo "Job:   $SLURM_JOB_ID"
+echo "Start: $(date)"
 echo "================================================================"
 
 # --- Environment ---
@@ -36,11 +39,11 @@ unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
 # --- Paths ---
 PROJECT_DIR="$(pwd)"
 NIFTI_DIR="${PROJECT_DIR}/results/nifti"
+SPINEPS_DIR="${PROJECT_DIR}/results/spineps"
+TOTALSPINE_DIR="${PROJECT_DIR}/results/totalspineseg"
 REGISTERED_DIR="${PROJECT_DIR}/results/registered"
-LSTV_DIR="${PROJECT_DIR}/results/lstv_detection"
-OUTPUT_DIR="${PROJECT_DIR}/results/lstv_viz"
 
-mkdir -p logs "$OUTPUT_DIR"
+mkdir -p logs "$REGISTERED_DIR"
 
 # --- Container ---
 CONTAINER="docker://go2432/spineps-preprocessing:latest"
@@ -51,22 +54,14 @@ if [[ ! -f "$IMG_PATH" ]]; then
     singularity pull "$IMG_PATH" "$CONTAINER"
 fi
 
-# --- Optional args ---
-LSTV_JSON="${LSTV_DIR}/lstv_results.json"
-LSTV_JSON_ARG=""
-if [[ -f "$LSTV_JSON" ]]; then
-    LSTV_JSON_ARG="--lstv_json /work/results/lstv_detection/lstv_results.json"
-    echo "Detection results found — summary panels will be annotated."
-else
-    echo "WARNING: lstv_results.json not found. Run 04_lstv_detection.sh first."
+# --- Build optional args ---
+EXTRA_ARGS=""
+if [[ "$RETRY_FAILED" == "true" ]]; then
+    EXTRA_ARGS="$EXTRA_ARGS --retry-failed"
 fi
-
-STUDY_ID_ARG=""
 if [[ -n "$STUDY_ID" ]]; then
-    STUDY_ID_ARG="--study_id ${STUDY_ID}"
+    EXTRA_ARGS="$EXTRA_ARGS --study_id ${STUDY_ID}"
     echo "Single-study mode: $STUDY_ID"
-else
-    echo "Batch mode"
 fi
 
 # --- Run ---
@@ -75,14 +70,14 @@ singularity exec \
     --env PYTHONUNBUFFERED=1 \
     --pwd /work \
     "$IMG_PATH" \
-    python3 -u /work/scripts/05_visualize_overlay.py \
-        --registered_dir /work/results/registered \
+    python3 -u /work/scripts/03b_register_to_axial.py \
         --nifti_dir      /work/results/nifti \
-        --output_dir     /work/results/lstv_viz \
-        ${STUDY_ID_ARG} \
-        ${LSTV_JSON_ARG}
+        --spineps_dir    /work/results/spineps \
+        --totalspine_dir /work/results/totalspineseg \
+        --registered_dir /work/results/registered \
+        --mode           "$MODE" \
+        $EXTRA_ARGS
 
 echo "================================================================"
-echo "Visualization complete | PNGs -> ${OUTPUT_DIR}"
-echo "End: $(date)"
+echo "Registration complete | End: $(date)"
 echo "================================================================"
