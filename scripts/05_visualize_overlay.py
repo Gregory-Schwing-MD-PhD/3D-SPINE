@@ -141,10 +141,7 @@ def dilate_for_display(mask: np.ndarray, voxels: int = 2) -> np.ndarray:
 # ============================================================================
 
 def largest_cc_2d(mask2d: np.ndarray) -> np.ndarray:
-    """
-    Return a boolean mask containing only the largest connected component
-    of mask2d.  Returns an all-False array if mask2d is empty.
-    """
+    """Largest CC of a 2-D boolean mask."""
     if not mask2d.any():
         return np.zeros_like(mask2d, dtype=bool)
     labeled, n = cc_label(mask2d)
@@ -155,16 +152,44 @@ def largest_cc_2d(mask2d: np.ndarray) -> np.ndarray:
     return labeled == best_i
 
 
-def largest_cc_3d(mask3d: np.ndarray) -> np.ndarray:
-    """Largest connected component of a 3-D boolean mask."""
-    if not mask3d.any():
-        return np.zeros_like(mask3d, dtype=bool)
-    labeled, n = cc_label(mask3d)
+def inferiormost_tp_cc(tp_mask3d: np.ndarray,
+                        sacrum_mask3d) -> np.ndarray:
+    """
+    Isolate the L5 TP blob from a 3-D TP label mask containing blobs at
+    multiple spinal levels (SPINEPS uses the same label for all TPs).
+
+    1. Find all 3-D CCs.
+    2. Exclude any CC whose z_max >= sacrum z_min (overlaps/inferior to sacrum).
+    3. Pick the CC with the LOWEST z-centroid among survivors (most caudal = L5).
+    4. Fallback: globally lowest-z CC if sacrum filter removes everything.
+    """
+    if not tp_mask3d.any():
+        return np.zeros_like(tp_mask3d, dtype=bool)
+    labeled, n = cc_label(tp_mask3d)
     if n == 0:
-        return np.zeros_like(mask3d, dtype=bool)
-    sizes  = [(labeled == i).sum() for i in range(1, n + 1)]
-    best_i = int(np.argmax(sizes)) + 1
-    return labeled == best_i
+        return np.zeros_like(tp_mask3d, dtype=bool)
+    if n == 1:
+        return tp_mask3d.astype(bool)
+
+    sac_z_min = None
+    if sacrum_mask3d is not None and sacrum_mask3d.any():
+        sac_z_min = int(np.where(sacrum_mask3d)[2].min())
+
+    cc_info = []
+    for i in range(1, n + 1):
+        comp     = (labeled == i)
+        z_coords = np.where(comp)[2]
+        cc_info.append((float(z_coords.mean()), int(z_coords.max()), comp))
+
+    # Sort by z_centroid ascending (most inferior / lowest z first)
+    cc_info.sort(key=lambda t: t[0])
+
+    if sac_z_min is not None:
+        candidates = [(zc, zm, c) for zc, zm, c in cc_info if zm < sac_z_min]
+        if candidates:
+            return candidates[0][2].astype(bool)
+
+    return cc_info[0][2].astype(bool)
 
 
 # ============================================================================
@@ -267,47 +292,50 @@ def ax_z_to_sag_z(ax_nii:  Optional[nib.Nifti1Image],
 
 
 # ============================================================================
-# SLICE SELECTION: max craniocaudal TP height  (Type I)
+# SLICE SELECTION: L5 TP isolation + max craniocaudal height  (Type I)
 # ============================================================================
 
-def best_x_for_tp_height(orig_spineps: Optional[np.ndarray],
-                          orig_tss_sag:  Optional[np.ndarray],
-                          tp_label: int,
-                          tv_label: int,
+def isolate_l5_tp_sag(orig_spineps: Optional[np.ndarray],
+                       orig_tss_sag: Optional[np.ndarray],
+                       tp_label:     int,
+                       tv_label:     int) -> np.ndarray:
+    """
+    Return a 3-D boolean mask containing ONLY the L5 TP blob in sagittal space.
+    Uses inferiormost_tp_cc() — anatomy-driven, not label-range-driven.
+    """
+    zeros = np.zeros((1, 1, 1), dtype=bool)
+    if orig_spineps is None:
+        return zeros
+    tp_full = (orig_spineps == tp_label).astype(bool)
+    if not tp_full.any():
+        return tp_full
+
+    # Sacrum in sagittal space
+    sacrum_sag = None
+    if orig_tss_sag is not None:
+        s = (orig_tss_sag == SACRUM_LABEL)
+        if s.any():
+            sacrum_sag = s
+
+    return inferiormost_tp_cc(tp_full, sacrum_sag)
+
+
+def best_x_for_tp_height(tp_l5_3d: np.ndarray,
                           vox_z_mm: float) -> Tuple[int, float]:
     """
-    For each sagittal x-slice, isolate the LARGEST CONNECTED COMPONENT of the
-    TV-restricted TP mask and measure its craniocaudal z-span.
-    Returns (best_x, max_span_mm).
+    Given the already-isolated L5 TP mask (3-D sagittal), find the x-slice
+    with maximum craniocaudal z-span.  Returns (best_x, max_span_mm).
+    No further CC filtering needed — mask is already a single blob.
     """
-    if orig_spineps is None:
-        return 0, 0.0
+    if not tp_l5_3d.any():
+        return tp_l5_3d.shape[0] // 2, 0.0
 
-    tp_3d = (orig_spineps == tp_label)
-
-    # Restrict to TV z-range in sagittal space
-    if orig_tss_sag is not None:
-        zr = get_tv_z_range(orig_tss_sag, tv_label)
-        if zr is not None:
-            z_lo, z_hi = zr
-            tmp = np.zeros_like(tp_3d)
-            tmp[:, :, z_lo:z_hi + 1] = tp_3d[:, :, z_lo:z_hi + 1]
-            if tmp.any():
-                tp_3d = tmp
-
-    if not tp_3d.any():
-        return orig_spineps.shape[0] // 2, 0.0
-
-    best_x, best_span = orig_spineps.shape[0] // 2, 0.0
-    for x in range(orig_spineps.shape[0]):
-        col = tp_3d[x]                          # shape (Y, Z)
+    best_x, best_span = tp_l5_3d.shape[0] // 2, 0.0
+    for x in range(tp_l5_3d.shape[0]):
+        col = tp_l5_3d[x]           # (Y, Z)
         if not col.any():
             continue
-        # Largest CC in this 2-D sagittal slice
-        lcc = largest_cc_2d(col)
-        if not lcc.any():
-            continue
-        zc   = np.where(lcc.any(axis=0))[0]    # z-indices occupied by LCC
+        zc   = np.where(col.any(axis=0))[0]
         if zc.size < 2:
             continue
         span = (zc.max() - zc.min()) * vox_z_mm
@@ -468,29 +496,31 @@ def _draw_gap_ruler(ax,
 # ============================================================================
 
 def _panel_sag_tp_height(ax,
-                          sag_img:     Optional[np.ndarray],
-                          sag_spineps: Optional[np.ndarray],
-                          sag_tss:     Optional[np.ndarray],
-                          tp_label:    int,
-                          side_name:   str,
-                          x_idx:       int,
-                          span_mm:     float,
-                          vox_z_mm:    float,
-                          z_tv_sag:    Optional[float],
-                          z_md_sag:    Optional[float],
-                          tv_name:     str):
-    """Row 0 — Type I check.  Yellow ruler on largest CC only."""
-    color_this  = [1.00, 0.10, 0.10] if tp_label == TP_LEFT_LABEL else [0.00, 0.80, 1.00]
-    color_other = [0.00, 0.80, 1.00] if tp_label == TP_LEFT_LABEL else [1.00, 0.10, 0.10]
-    other_label = TP_RIGHT_LABEL     if tp_label == TP_LEFT_LABEL else TP_LEFT_LABEL
+                          sag_img:      Optional[np.ndarray],
+                          tp_l5_mask:   Optional[np.ndarray],
+                          tp_other_mask: Optional[np.ndarray],
+                          sag_tss:      Optional[np.ndarray],
+                          side_name:    str,
+                          x_idx:        int,
+                          span_mm:      float,
+                          vox_z_mm:     float,
+                          z_tv_sag:     Optional[float],
+                          z_md_sag:     Optional[float],
+                          tv_name:      str):
+    """Row 0 — Type I check.  Yellow ruler spans the L5-only blob at best x."""
+    color_this  = [1.00, 0.10, 0.10] if side_name == 'Left' else [0.00, 0.80, 1.00]
+    color_other = [0.00, 0.80, 1.00] if side_name == 'Left' else [1.00, 0.10, 0.10]
 
     ax.imshow(norm(_sag_sl(sag_img, x_idx)).T, cmap='gray', origin='lower', alpha=0.80)
 
-    if sag_spineps is not None:
-        overlay_mask(ax, _sag_sl(sag_spineps == other_label, x_idx), color_other, 0.22)
-        this_sl = _sag_sl(sag_spineps == tp_label, x_idx)
+    # Other side L5 blob — faint context
+    if tp_other_mask is not None and tp_other_mask.any():
+        overlay_mask(ax, _sag_sl(tp_other_mask, x_idx), color_other, 0.22)
+
+    # This side L5 blob — full brightness, ruler
+    if tp_l5_mask is not None and tp_l5_mask.any():
+        this_sl = _sag_sl(tp_l5_mask, x_idx)
         overlay_mask(ax, this_sl, color_this, 0.85)
-        # Ruler on largest CC only
         _draw_height_ruler(ax, this_sl, vox_z_mm, color='yellow')
 
     if sag_tss is not None:
@@ -559,33 +589,33 @@ def _panel_tss_axial_with_tps(ax,
 
 
 def _panel_sag_tp_proximity(ax,
-                              sag_img:     Optional[np.ndarray],
-                              sag_spineps: Optional[np.ndarray],
-                              sag_tss:     Optional[np.ndarray],
-                              tp_label:    int,
-                              side_name:   str,
-                              x_idx:       int,
-                              dist_mm:     float,
-                              vox_z_mm:    float,
-                              z_tv_sag:    Optional[float],
-                              z_md_sag:    Optional[float],
-                              tv_name:     str):
+                              sag_img:       Optional[np.ndarray],
+                              sag_spineps:   Optional[np.ndarray],
+                              tp_other_mask: Optional[np.ndarray],
+                              sag_tss:       Optional[np.ndarray],
+                              side_name:     str,
+                              x_idx:         int,
+                              dist_mm:       float,
+                              vox_z_mm:      float,
+                              z_tv_sag:      Optional[float],
+                              z_md_sag:      Optional[float],
+                              tv_name:       str):
     """
     Row 1 — Type II/III check.
-    Same x-slice as height panel; orange gap ruler between TP inferior edge
-    and sacrum superior edge.
+    sag_spineps is the L5-only TP boolean mask (already isolated).
+    Orange gap ruler between TP inferior edge and sacrum superior edge.
     """
-    color_this  = [1.00, 0.10, 0.10] if tp_label == TP_LEFT_LABEL else [0.00, 0.80, 1.00]
-    color_other = [0.00, 0.80, 1.00] if tp_label == TP_LEFT_LABEL else [1.00, 0.10, 0.10]
-    other_label = TP_RIGHT_LABEL     if tp_label == TP_LEFT_LABEL else TP_LEFT_LABEL
+    color_this  = [1.00, 0.10, 0.10] if side_name == 'Left' else [0.00, 0.80, 1.00]
+    color_other = [0.00, 0.80, 1.00] if side_name == 'Left' else [1.00, 0.10, 0.10]
 
     ax.imshow(norm(_sag_sl(sag_img, x_idx)).T, cmap='gray', origin='lower', alpha=0.80)
 
-    this_sl   = _sag_sl(sag_spineps == tp_label, x_idx)  if sag_spineps is not None else np.zeros((1,1), bool)
-    sacrum_sl = _sag_sl(sag_tss    == SACRUM_LABEL, x_idx) if sag_tss    is not None else np.zeros((1,1), bool)
+    this_sl   = _sag_sl(sag_spineps, x_idx) if (sag_spineps is not None and sag_spineps.any()) else np.zeros((1,1), bool)
+    sacrum_sl = _sag_sl(sag_tss == SACRUM_LABEL, x_idx) if sag_tss is not None else np.zeros((1,1), bool)
 
-    if sag_spineps is not None:
-        overlay_mask(ax, _sag_sl(sag_spineps == other_label, x_idx), color_other, 0.22)
+    if tp_other_mask is not None and tp_other_mask.any():
+        overlay_mask(ax, _sag_sl(tp_other_mask, x_idx), color_other, 0.22)
+    if sag_spineps is not None and sag_spineps.any():
         overlay_mask(ax, this_sl, color_this, 0.85)
     if sag_tss is not None:
         overlay_mask(ax, sacrum_sl, [1.00, 0.55, 0.00], 0.60)
@@ -822,11 +852,21 @@ def visualize_study(
     logger.info(f"  [{study_id}] z_tv={z_tv}  "
                 f"z_md_L={z_md_L}({dist_L:.1f}mm)  z_md_R={z_md_R}({dist_R:.1f}mm)")
 
+    # ── Isolate L5-only TP blobs in sagittal space ───────────────────────────
+    # Use sacrum from orig_tss_sag as anatomical constraint
+    sac_sag_mask = ((orig_tss_sag == SACRUM_LABEL) if orig_tss_sag is not None
+                    else None)
+    tp_l5_left_sag  = isolate_l5_tp_sag(orig_spineps, orig_tss_sag,
+                                          TP_LEFT_LABEL,  tv_label)
+    tp_l5_right_sag = isolate_l5_tp_sag(orig_spineps, orig_tss_sag,
+                                          TP_RIGHT_LABEL, tv_label)
+
+    logger.info(f"  [{study_id}] L5-left voxels={tp_l5_left_sag.sum()}  "
+                f"L5-right voxels={tp_l5_right_sag.sum()}")
+
     # ── Max-height sagittal slices per side ───────────────────────────────────
-    x_left,  span_L = best_x_for_tp_height(orig_spineps, orig_tss_sag,
-                                            TP_LEFT_LABEL,  tv_label, vox_sag[2])
-    x_right, span_R = best_x_for_tp_height(orig_spineps, orig_tss_sag,
-                                            TP_RIGHT_LABEL, tv_label, vox_sag[2])
+    x_left,  span_L = best_x_for_tp_height(tp_l5_left_sag,  vox_sag[2])
+    x_right, span_R = best_x_for_tp_height(tp_l5_right_sag, vox_sag[2])
 
     logger.info(f"  [{study_id}] x_left={x_left}({span_L:.1f}mm)  "
                 f"x_right={x_right}({span_R:.1f}mm)")
@@ -863,12 +903,12 @@ def visualize_study(
 
     if sag_bg is not None:
         _panel_sag_tp_height(
-            axes[0, 0], sag_bg, orig_spineps, orig_tss_sag,
-            TP_LEFT_LABEL, 'Left', x_left, span_L, vox_sag[2],
+            axes[0, 0], sag_bg, tp_l5_left_sag, tp_l5_right_sag, orig_tss_sag,
+            'Left', x_left, span_L, vox_sag[2],
             z_tv_sag, z_md_L_sag, tv_name)
         _panel_sag_tp_height(
-            axes[0, 1], sag_bg, orig_spineps, orig_tss_sag,
-            TP_RIGHT_LABEL, 'Right', x_right, span_R, vox_sag[2],
+            axes[0, 1], sag_bg, tp_l5_right_sag, tp_l5_left_sag, orig_tss_sag,
+            'Right', x_right, span_R, vox_sag[2],
             z_tv_sag, z_md_R_sag, tv_name)
     else:
         _unavailable(axes[0, 0], 'Sagittal T2w not found')
@@ -890,12 +930,12 @@ def visualize_study(
 
     if sag_bg is not None:
         _panel_sag_tp_proximity(
-            axes[1, 0], sag_bg, orig_spineps, orig_tss_sag,
-            TP_LEFT_LABEL, 'Left', x_left, dist_L, vox_sag[2],
+            axes[1, 0], sag_bg, tp_l5_left_sag, tp_l5_right_sag, orig_tss_sag,
+            'Left', x_left, dist_L, vox_sag[2],
             z_tv_sag, z_md_L_sag, tv_name)
         _panel_sag_tp_proximity(
-            axes[1, 1], sag_bg, orig_spineps, orig_tss_sag,
-            TP_RIGHT_LABEL, 'Right', x_right, dist_R, vox_sag[2],
+            axes[1, 1], sag_bg, tp_l5_right_sag, tp_l5_left_sag, orig_tss_sag,
+            'Right', x_right, dist_R, vox_sag[2],
             z_tv_sag, z_md_R_sag, tv_name)
     else:
         _unavailable(axes[1, 0], 'Sagittal T2w not found')
