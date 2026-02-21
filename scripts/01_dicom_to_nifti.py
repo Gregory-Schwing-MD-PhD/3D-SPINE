@@ -5,6 +5,8 @@ DICOM to NIfTI Converter
 Converts DICOM studies to NIfTI format using dcm2niix.
 Converts both sagittal T2w and axial T2 series via the series descriptions CSV.
 
+Filters to validation set only (via valid_id.npy) to prevent data leakage.
+
 NIfTI output layout:
   results/nifti/{study_id}/{series_id}/sub-{study_id}_acq-sag_T2w.nii.gz
   results/nifti/{study_id}/{series_id}/sub-{study_id}_acq-ax_T2w.nii.gz
@@ -14,6 +16,7 @@ Usage:
         --input_dir  data/raw/train_images \
         --series_csv data/raw/train_series_descriptions.csv \
         --output_dir results/nifti \
+        --valid_ids  models/valid_id.npy \
         --mode prod
 """
 
@@ -190,6 +193,8 @@ def main():
                         help='CSV with study_id, series_id, series_description')
     parser.add_argument('--output_dir', required=True,
                         help='Root NIfTI output directory')
+    parser.add_argument('--valid_ids',  required=True,
+                        help='Path to valid_id.npy — only these study IDs will be processed')
     parser.add_argument('--limit', type=int, default=None)
     parser.add_argument('--mode', choices=['trial', 'debug', 'prod'], default='prod')
     args = parser.parse_args()
@@ -201,6 +206,17 @@ def main():
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- Load and apply validation ID filter (prevents data leakage) ---
+    valid_ids_path = Path(args.valid_ids)
+    if not valid_ids_path.exists():
+        logger.error(f"valid_ids file not found: {valid_ids_path}")
+        logger.error("Download it first: sbatch slurm_scripts/00_download_all.sh")
+        return 1
+
+    valid_ids = set(str(v) for v in np.load(valid_ids_path))
+    logger.info(f"✓ Loaded {len(valid_ids)} validation study IDs from {valid_ids_path}")
+    logger.info("  VALIDATION SET ONLY — no data leakage")
+
     series_df = load_series_csv(Path(args.series_csv))
     if series_df is None:
         return 1
@@ -209,6 +225,11 @@ def main():
     already_processed = set(progress['processed'])
 
     study_dirs = sorted([d for d in input_dir.iterdir() if d.is_dir()])
+
+    # Filter to validation set
+    n_total = len(study_dirs)
+    study_dirs = [d for d in study_dirs if d.name in valid_ids]
+    logger.info(f"After validation filter: {len(study_dirs)} / {n_total} studies retained")
 
     # Filter already-processed BEFORE applying mode limits
     study_dirs = [d for d in study_dirs if d.name not in already_processed]
@@ -320,7 +341,7 @@ def main():
     if progress['failed']:
         logger.info(f"Failed IDs: {progress['failed']}")
     logger.info(f"\nNIfTI files: {output_dir}/{{study_id}}/{{series_id}}/sub-*_acq-[sag|ax]_T2w.nii.gz")
-    logger.info("Next step: sbatch slurm_scripts/02_spineps.sh")
+    logger.info("Next step: sbatch slurm_scripts/02_lstv_trial.sh")
 
     return 0 if error_count == 0 else 1
 

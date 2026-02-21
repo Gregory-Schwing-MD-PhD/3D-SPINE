@@ -40,7 +40,6 @@ mkdir -p "$DATA_DIR" "$MODELS_DIR" "$TMP_DIR" logs
 
 # --- Cleanup on exit ---
 cleanup() {
-    rm -rf "$TMP_DIR"
     rm -rf "${PROJECT_DIR}/.kaggle_tmp"
 }
 trap cleanup EXIT
@@ -75,91 +74,12 @@ cp "${HOME}/.kaggle/kaggle.json" "${PROJECT_DIR}/.kaggle_tmp/"
 chmod 600 "${PROJECT_DIR}/.kaggle_tmp/kaggle.json"
 
 # ================================================================
-# PART 1: RSNA COMPETITION DATA (train CSV + DICOM images)
+# PART 1: MODEL CHECKPOINT + VALIDATION IDs
+# Must run before DICOM extraction — valid_id.npy gates what we extract
 # ================================================================
 echo ""
 echo "================================================================"
-echo "PART 1: RSNA COMPETITION DATA"
-echo "================================================================"
-
-# Use single-quoted heredoc so the outer shell does NO variable expansion.
-# All $ references inside belong to the inner bash/python processes.
-singularity exec \
-    --bind "${PROJECT_DIR}:/work" \
-    --bind "${PROJECT_DIR}/.kaggle_tmp:/root/.kaggle" \
-    --pwd /work \
-    "$SPINEPS_IMG" \
-    bash -c '
-        set -euo pipefail
-
-        cd /work/.tmp_dl
-
-        # --- train_series_descriptions.csv ---
-        if [ -f "/work/data/raw/train_series_descriptions.csv" ]; then
-            echo "✓ train_series_descriptions.csv already exists, skipping."
-        else
-            echo "Downloading train_series_descriptions.csv..."
-            kaggle competitions download \
-                -c rsna-2024-lumbar-spine-degenerative-classification \
-                -f train_series_descriptions.csv
-
-            if [ -f "train_series_descriptions.csv.zip" ]; then
-                unzip -o train_series_descriptions.csv.zip
-            fi
-            mv train_series_descriptions.csv /work/data/raw/
-            echo "✓ train_series_descriptions.csv downloaded"
-        fi
-
-        # --- DICOM images ---
-        ZIP_FILE="rsna-2024-lumbar-spine-degenerative-classification.zip"
-
-        EXISTING=0
-        if [ -d "/work/data/raw/train_images" ]; then
-            EXISTING=$(ls /work/data/raw/train_images/ | wc -l)
-        fi
-        echo "Already extracted studies: $EXISTING"
-
-        if [ ! -f "$ZIP_FILE" ]; then
-            echo "Downloading full competition zip (ALL DICOM images)..."
-            kaggle competitions download -c rsna-2024-lumbar-spine-degenerative-classification
-        else
-            echo "✓ Competition zip already present, skipping download."
-        fi
-
-        echo "Extracting missing studies..."
-        # Pass zip path as argument so Python does not need shell variable expansion
-        python3 - "$ZIP_FILE" <<'"'"'PYEOF'"'"'
-import sys, zipfile
-from pathlib import Path
-
-zip_path = sys.argv[1]
-output_dir = Path("/work/data/raw/train_images")
-existing_studies = set(d.name for d in output_dir.iterdir() if d.is_dir()) if output_dir.exists() else set()
-
-print(f"Already extracted: {len(existing_studies)} studies")
-
-with zipfile.ZipFile(zip_path, "r") as z:
-    to_extract = [f for f in z.namelist() if f.startswith("train_images/")]
-    if existing_studies:
-        to_extract = [
-            f for f in to_extract
-            if len(f.split("/")) <= 1 or f.split("/")[1] not in existing_studies
-        ]
-    print(f"Files to extract: {len(to_extract)}")
-    if to_extract:
-        z.extractall("/work/data/raw", members=to_extract)
-        print("✓ Extraction complete")
-    else:
-        print("✓ All studies already extracted, nothing to do")
-PYEOF
-    '
-
-# ================================================================
-# PART 2: MODEL CHECKPOINT + VALIDATION IDs
-# ================================================================
-echo ""
-echo "================================================================"
-echo "PART 2: POINT NET MODEL CHECKPOINT + VALIDATION IDs"
+echo "PART 1: POINT NET MODEL CHECKPOINT + VALIDATION IDs"
 echo "Dataset: rsna2024-demo-workflow (by hengck23)"
 echo "================================================================"
 
@@ -191,6 +111,92 @@ else
 
     echo "✓ Model checkpoint and validation IDs downloaded"
 fi
+
+# ================================================================
+# PART 2: RSNA COMPETITION DATA (train CSV + DICOM images)
+# Runs after Part 1 so valid_id.npy is available to gate extraction
+# ================================================================
+echo ""
+echo "================================================================"
+echo "PART 2: RSNA COMPETITION DATA"
+echo "================================================================"
+
+# Use single-quoted heredoc so the outer shell does NO variable expansion.
+# All $ references inside belong to the inner bash/python processes.
+singularity exec \
+    --bind "${PROJECT_DIR}:/work" \
+    --bind "${PROJECT_DIR}/.kaggle_tmp:/root/.kaggle" \
+    --pwd /work \
+    "$SPINEPS_IMG" \
+    bash -c '
+        set -euo pipefail
+
+        cd /work/.tmp_dl
+
+        # --- train_series_descriptions.csv ---
+        if [ -f "/work/data/raw/train_series_descriptions.csv" ]; then
+            echo "✓ train_series_descriptions.csv already exists, skipping."
+        else
+            echo "Downloading train_series_descriptions.csv..."
+            kaggle competitions download \
+                -c rsna-2024-lumbar-spine-degenerative-classification \
+                -f train_series_descriptions.csv
+
+            if [ -f "train_series_descriptions.csv.zip" ]; then
+                unzip -o train_series_descriptions.csv.zip
+            fi
+            mv train_series_descriptions.csv /work/data/raw/
+            echo "✓ train_series_descriptions.csv downloaded"
+        fi
+
+        # --- DICOM images ---
+        # Zip is stored in data/raw so it persists across runs and survives
+        # .tmp_dl cleanup. We only re-download if it is genuinely absent.
+        ZIP_FILE="/work/data/raw/rsna-2024-lumbar-spine-degenerative-classification.zip"
+
+        if [ ! -f "$ZIP_FILE" ]; then
+            echo "Downloading full competition zip (ALL DICOM images)..."
+            kaggle competitions download \
+                -c rsna-2024-lumbar-spine-degenerative-classification \
+                -p /work/data/raw
+        else
+            echo "✓ Competition zip already present at $ZIP_FILE, skipping download."
+        fi
+
+        echo "Extracting missing validation studies..."
+        # Only extract studies in valid_id.npy — no point pulling training data.
+        # valid_id.npy is guaranteed to exist at this point (downloaded in Part 1).
+        python3 - "$ZIP_FILE" <<'"'"'PYEOF'"'"'
+import sys, zipfile, numpy as np
+from pathlib import Path
+
+zip_path   = sys.argv[1]
+output_dir = Path("/work/data/raw/train_images")
+valid_ids  = set(str(v) for v in np.load("/work/models/valid_id.npy"))
+
+existing_studies = set(d.name for d in output_dir.iterdir() if d.is_dir()) if output_dir.exists() else set()
+missing_valid    = valid_ids - existing_studies
+
+print(f"Validation IDs total:  {len(valid_ids)}")
+print(f"Already on disk:       {len(existing_studies)} studies")
+print(f"Need to extract:       {len(missing_valid)} studies")
+
+if not missing_valid:
+    print("✓ All validation studies already extracted, nothing to do")
+    sys.exit(0)
+
+with zipfile.ZipFile(zip_path, "r") as z:
+    to_extract = [
+        f for f in z.namelist()
+        if f.startswith("train_images/") and (
+            len(f.split("/")) <= 1 or f.split("/")[1] in missing_valid
+        )
+    ]
+    print(f"Files to extract: {len(to_extract)}")
+    z.extractall("/work/data/raw", members=to_extract)
+    print("✓ Extraction complete")
+PYEOF
+    '
 
 # ================================================================
 # VERIFICATION
