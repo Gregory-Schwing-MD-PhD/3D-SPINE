@@ -243,14 +243,19 @@ def normalise_to_8bit(arr: np.ndarray) -> np.ndarray:
 
 def read_nifti_series(nifti_dir: Path, study_id: str) -> Optional[np.ndarray]:
     """
-    Load the sagittal T2w NIfTI for a study and return a (Depth, Height, Width)
-    uint8 volume ready for the model.
+    Load the sagittal T2w NIfTI for a study and return a (D, H, W) uint8 volume.
 
-    nibabel canonical orientation loads as (X, Y, Z) = (Sagittal, Coronal, Axial).
-    We want to slice along the sagittal axis (first axis after transpose), so:
+    dcm2niix preserves the original DICOM acquisition geometry: for sagittal T2w
+    the slice axis (the direction the scanner stepped through) is stored as the
+    THIRD axis in the NIfTI (i, j, k) = (in-plane col, in-plane row, slice).
+    So raw shape from nibabel is (cols, rows, slices) = (W, H, D).
 
-        raw shape:     (X, Y, Z)
-        after T(0,2,1): (X, Z, Y)  →  slice [mid] gives (Z, Y) = (Height, Width) ✓
+    We do NOT call as_closest_canonical — that reorients to RAS and can move
+    the slice axis to a completely different position, giving the model a
+    coronal or axial reformatted image instead of a true sagittal slice.
+
+    To get (D, H, W) we simply transpose: (W, H, D) → (D, H, W) = (2, 1, 0).
+    Then volume[mid] is a genuine in-plane sagittal image.
 
     Args:
         nifti_dir: directory containing sub-{study_id}_acq-sag_T2w.nii.gz
@@ -270,17 +275,18 @@ def read_nifti_series(nifti_dir: Path, study_id: str) -> Optional[np.ndarray]:
 
     try:
         img = nib.load(str(nifti_path))
-        # Reorient to closest canonical (RAS) so axes are consistent
-        img = nib.as_closest_canonical(img)
-        # float32 avoids precision loss during transpose / normalisation
-        data = img.get_fdata(dtype=np.float32)
-
-        # data is (X, Y, Z) = (Sagittal, Coronal, Axial)
-        # Transpose to (X, Z, Y) so slicing axis-0 gives a (Z, Y) sagittal image
-        data = np.transpose(data, (0, 2, 1))   # → (D, H, W)
+        # Do NOT reorient — dcm2niix preserves acquisition geometry.
+        # NIfTI i/j/k axes for a sagittal acquisition:
+        #   i = in-plane column  (W)
+        #   j = in-plane row     (H)
+        #   k = slice index      (D)
+        # So raw data shape = (W, H, D). Transpose to (D, H, W).
+        data = np.asarray(img.dataobj, dtype=np.float32)   # (W, H, D)
+        data = np.transpose(data, (2, 1, 0))               # → (D, H, W)
 
         volume = normalise_to_8bit(data)
-        logger.debug(f"Loaded NIfTI {nifti_path.name}: {volume.shape}, dtype={volume.dtype}")
+        logger.info(f"  NIfTI loaded: {nifti_path.name}  shape={volume.shape}  "
+                    f"dtype={volume.dtype}  range=[{data.min():.0f},{data.max():.0f}]")
         return volume
 
     except Exception as e:
@@ -366,7 +372,9 @@ def run_inference(args):
     sagittal_df = series_df[
         series_df['series_description'].str.lower().str.contains('sagittal') &
         series_df['series_description'].str.lower().str.contains('t2')
-    ]
+    ].copy()
+    # Normalize to str so comparisons work regardless of CSV int vs string IDs
+    sagittal_df['study_id'] = sagittal_df['study_id'].astype(str)
     studies = sagittal_df['study_id'].unique()
     logger.info(f"Found {len(studies)} studies with Sagittal T2 series")
 
@@ -383,6 +391,7 @@ def run_inference(args):
         studies_set = set(str(s) for s in studies)
         studies = [v for v in valid_ids_ordered if v in studies_set][:args.trial_size]
         logger.info(f"Trial mode: first {len(studies)} studies from valid_id.npy (reproducible)")
+    elif args.mode == 'debug':
         studies = [args.debug_study_id] if args.debug_study_id else [studies[0]]
         logger.info(f"Debug mode: study {studies[0]}")
     else:
@@ -441,7 +450,7 @@ def run_inference(args):
     for study_id in iterator:
         logger.info(f"\n{'='*60}\nStudy: {study_id}\n{'='*60}")
 
-        study_series = sagittal_df[sagittal_df['study_id'] == study_id]
+        study_series = sagittal_df[sagittal_df['study_id'] == str(study_id)]
         if len(study_series) == 0:
             logger.warning(f"No Sagittal T2 series for {study_id}")
             continue
@@ -450,10 +459,13 @@ def run_inference(args):
         logger.info(f"Series: {series_id}")
 
         # --- Locate NIfTI ---
+        # series_id from CSV may be axial; find_nifti_dir will fallback-glob for sag NIfTI
         nifti_dir = find_nifti_dir(input_dir, str(study_id), str(series_id))
         if nifti_dir is None:
-            logger.warning(f"NIfTI directory not found for {study_id}/{series_id}")
+            logger.warning(f"Sagittal NIfTI not found for study {study_id} "
+                           f"(tried series {series_id} + all subdirs under {input_dir / str(study_id)})")
             continue
+        logger.info(f"Found NIfTI dir: {nifti_dir}")
 
         # --- Load volume from NIfTI ---
         volume = read_nifti_series(nifti_dir, str(study_id))
@@ -477,6 +489,9 @@ def run_inference(args):
 
                 mid_idx = resized.shape[0] // 2
                 image   = resized[mid_idx]  # (160, 160) sagittal slice
+                logger.info(f"  Mid-slice stats: min={image.min()} max={image.max()} "
+                            f"mean={image.mean():.1f} std={image.std():.1f} "
+                            f"(slice {mid_idx}/{resized.shape[0]})")
 
                 image_tensor = torch.from_numpy(image).unsqueeze(0).unsqueeze(0).byte().to(device)
                 batch = {'sagittal': image_tensor}
@@ -529,11 +544,14 @@ def run_inference(args):
     logger.info("\n" + "=" * 60)
     logger.info("SUMMARY STATISTICS")
     logger.info("=" * 60)
-    for level in ['l1_l2', 'l2_l3', 'l3_l4', 'l4_l5', 'l5_s1']:
-        ec = f'{level}_entropy'
-        cc = f'{level}_confidence'
-        logger.info(f"{level.upper()}: entropy={results_df[ec].mean():.4f}±{results_df[ec].std():.4f}  "
-                    f"conf={results_df[cc].mean():.4f}±{results_df[cc].std():.4f}")
+    if results_df.empty:
+        logger.warning("No studies processed — check NIfTI files exist under the correct study/series subdirectory")
+    else:
+        for level in ['l1_l2', 'l2_l3', 'l3_l4', 'l4_l5', 'l5_s1']:
+            ec = f'{level}_entropy'
+            cc = f'{level}_confidence'
+            logger.info(f"{level.upper()}: entropy={results_df[ec].mean():.4f}±{results_df[ec].std():.4f}  "
+                        f"conf={results_df[cc].mean():.4f}±{results_df[cc].std():.4f}")
 
 
 def save_debug_visualizations(output_dir: Path, study_id, series_id,

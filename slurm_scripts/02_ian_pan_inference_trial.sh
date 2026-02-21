@@ -7,15 +7,15 @@
 #SBATCH --gres=gpu:1
 #SBATCH --constraint=v100
 #SBATCH --time=02:00:00
-#SBATCH --job-name=lstv_trial
-#SBATCH -o logs/trial_%j.out
-#SBATCH -e logs/trial_%j.err
+#SBATCH --job-name=lstv_dicom_trial
+#SBATCH -o logs/trial_dicom_%j.out
+#SBATCH -e logs/trial_dicom_%j.err
 
 set -euo pipefail
 set -x
 
 echo "================================================================"
-echo "LSTV Uncertainty Detection - TRIAL MODE (10 studies)"
+echo "LSTV Uncertainty Detection - DICOM MODE (A/B test vs NIfTI)"
 echo "Job ID: $SLURM_JOB_ID"
 echo "Start time: $(date)"
 echo "Assigned GPUs: $CUDA_VISIBLE_DEVICES"
@@ -41,17 +41,17 @@ unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
 
 # Project paths
 PROJECT_DIR="$(pwd)"
-NIFTI_DIR="${PROJECT_DIR}/results/nifti"          # ← NIfTI root (not raw DICOMs)
+DICOM_DIR="${PROJECT_DIR}/data/raw/train_images"   # ← raw DICOMs
 SERIES_CSV="${PROJECT_DIR}/data/raw/train_series_descriptions.csv"
-OUTPUT_DIR="${PROJECT_DIR}/data/output/trial"
+OUTPUT_DIR="${PROJECT_DIR}/data/output/trial_dicom"
 MODELS_DIR="${PROJECT_DIR}/models"
 
-mkdir -p "$OUTPUT_DIR/logs" "$MODELS_DIR"
+mkdir -p "$OUTPUT_DIR" logs "$MODELS_DIR"
 
-# Sanity checks
-if [[ ! -d "$NIFTI_DIR" ]]; then
-    echo "ERROR: NIfTI directory not found: $NIFTI_DIR"
-    echo "Run DICOM conversion first: sbatch slurm_scripts/01_dicom_to_nifti.sh"
+# Preflight checks
+if [[ ! -d "$DICOM_DIR" ]]; then
+    echo "ERROR: DICOM directory not found: $DICOM_DIR"
+    echo "Run download first: sbatch slurm_scripts/00_download_all.sh"
     exit 1
 fi
 
@@ -73,13 +73,13 @@ echo "Container ready: $IMG_PATH"
 
 if [[ ! -f "${MODELS_DIR}/point_net_checkpoint.pth" ]]; then
     echo "================================================================"
-    echo "WARNING: Model checkpoint not found — running in MOCK mode"
+    echo "WARNING: Model checkpoint not found — will run in MOCK mode"
     echo "================================================================"
 fi
 
 echo "================================================================"
-echo "Starting LSTV Uncertainty Inference - TRIAL MODE"
-echo "NIfTI root:  $NIFTI_DIR"
+echo "Starting LSTV DICOM Inference - TRIAL MODE"
+echo "DICOM root:  $DICOM_DIR"
 echo "Series CSV:  $SERIES_CSV"
 echo "Output:      $OUTPUT_DIR"
 echo "Models:      $MODELS_DIR"
@@ -87,14 +87,14 @@ echo "================================================================"
 
 singularity exec --nv \
     --bind "${PROJECT_DIR}:/work" \
-    --bind "${NIFTI_DIR}:/data/nifti" \
+    --bind "${DICOM_DIR}:/data/input" \
     --bind "${OUTPUT_DIR}:/data/output" \
     --bind "${MODELS_DIR}:/app/models" \
     --bind "$(dirname $SERIES_CSV):/data/raw" \
     --pwd /work \
     "$IMG_PATH" \
-    python /work/scripts/inference.py \
-        --input_dir  /data/nifti \
+    python /work/scripts/inference_dicom.py \
+        --input_dir  /data/input \
         --series_csv /data/raw/train_series_descriptions.csv \
         --output_dir /data/output \
         --checkpoint /app/models/point_net_checkpoint.pth \
@@ -105,7 +105,7 @@ singularity exec --nv \
 inference_exit=$?
 
 if [ $inference_exit -ne 0 ]; then
-    echo "ERROR: Inference failed"
+    echo "ERROR: Inference failed (exit $inference_exit)"
     exit $inference_exit
 fi
 
@@ -117,16 +117,16 @@ echo "================================================================"
 singularity exec \
     --bind "${PROJECT_DIR}:/work" \
     --bind "${OUTPUT_DIR}:/data/output" \
-    --bind "${NIFTI_DIR}:/data/nifti" \
+    --bind "${DICOM_DIR}:/data/input" \
     --bind "$(dirname $SERIES_CSV):/data/raw" \
     --pwd /work \
     "$IMG_PATH" \
-    python /work/scripts/generate_report.py \
-        --csv       /data/output/lstv_uncertainty_metrics.csv \
-        --output    /data/output/report.html \
-        --data_dir  /data/nifti \
+    python /work/src/generate_report.py \
+        --csv        /data/output/lstv_uncertainty_metrics.csv \
+        --output     /data/output/report.html \
+        --data_dir   /data/input \
         --series_csv /data/raw/train_series_descriptions.csv \
-        --debug_dir /data/output/debug_visualizations
+        --debug_dir  /data/output/debug_visualizations
 
 echo "================================================================"
 echo "Complete! End time: $(date)"
@@ -135,6 +135,7 @@ echo ""
 echo "RESULTS:"
 echo "  CSV:    ${OUTPUT_DIR}/lstv_uncertainty_metrics.csv"
 echo "  Report: ${OUTPUT_DIR}/report.html"
+echo "  Images: ${OUTPUT_DIR}/debug_visualizations/"
 echo ""
-echo "Next: sbatch slurm_scripts/03_prod_inference.sh"
+echo "Compare against NIfTI results in: data/output/trial/"
 echo "================================================================"
