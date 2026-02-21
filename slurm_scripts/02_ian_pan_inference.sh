@@ -99,7 +99,8 @@ singularity exec --nv \
         --output_dir /data/output \
         --checkpoint /app/models/point_net_checkpoint.pth \
         --valid_ids  /app/models/valid_id.npy \
-        --mode trial
+        --mode trial \
+        --trial_size "${TRIAL_SIZE:-3}"
 
 inference_exit=$?
 

@@ -196,6 +196,8 @@ def main():
     parser.add_argument('--valid_ids',  required=True,
                         help='Path to valid_id.npy — only these study IDs will be processed')
     parser.add_argument('--limit', type=int, default=None)
+    parser.add_argument('--trial_size', type=int, default=3,
+                        help='Number of studies to process in trial mode (default: 3)')
     parser.add_argument('--mode', choices=['trial', 'debug', 'prod'], default='prod')
     args = parser.parse_args()
 
@@ -237,7 +239,10 @@ def main():
     if args.mode == 'debug':
         study_dirs = study_dirs[:1]
     elif args.mode == 'trial':
-        study_dirs = study_dirs[:3]
+        # Use first N studies in valid_id.npy order for reproducibility
+        valid_ids_ordered = [str(v) for v in np.load(valid_ids_path)]
+        study_dirs_map = {d.name: d for d in study_dirs}
+        study_dirs = [study_dirs_map[v] for v in valid_ids_ordered if v in study_dirs_map][:args.trial_size]
     elif args.limit:
         study_dirs = study_dirs[:args.limit]
 

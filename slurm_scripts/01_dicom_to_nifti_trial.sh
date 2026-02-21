@@ -70,7 +70,8 @@ singularity exec \
         --series_csv /data/raw/train_series_descriptions.csv \
         --output_dir /data/output \
         --valid_ids  /app/models/valid_id.npy \
-        --mode "$MODE"
+        --mode "$MODE" \
+        --trial_size "${TRIAL_SIZE:-3}"
 
 echo "================================================================"
 echo "Conversion complete | End: $(date)"

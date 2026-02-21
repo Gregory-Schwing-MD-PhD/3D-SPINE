@@ -378,9 +378,11 @@ def run_inference(args):
 
     # --- Mode selection ---
     if args.mode == 'trial':
-        studies = np.random.choice(studies, min(10, len(studies)), replace=False)
-        logger.info(f"Trial mode: {len(studies)} random studies")
-    elif args.mode == 'debug':
+        # Use first N studies in valid_id.npy order for reproducibility
+        valid_ids_ordered = [str(v) for v in np.load(valid_ids_path)]
+        studies_set = set(str(s) for s in studies)
+        studies = [v for v in valid_ids_ordered if v in studies_set][:args.trial_size]
+        logger.info(f"Trial mode: first {len(studies)} studies from valid_id.npy (reproducible)")
         studies = [args.debug_study_id] if args.debug_study_id else [studies[0]]
         logger.info(f"Debug mode: study {studies[0]}")
     else:
@@ -585,6 +587,8 @@ def main():
     parser.add_argument('--valid_ids',       default='models/valid_id.npy',
                         help='Path to valid_id.npy (prevents data leakage)')
     parser.add_argument('--mode',            choices=['trial', 'debug', 'prod'], default='trial')
+    parser.add_argument('--trial_size',      type=int, default=3,
+                        help='Number of studies to process in trial mode (default: 3)')
     parser.add_argument('--debug_study_id',  default=None,
                         help='Specific study ID for debug mode')
     args = parser.parse_args()
