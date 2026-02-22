@@ -5,7 +5,6 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:1
-#SBATCH --constraint=v100
 #SBATCH --time=36:00:00
 #SBATCH --job-name=totalspineseg_selective
 #SBATCH -o logs/totalspineseg_selective_%j.out
