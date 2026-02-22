@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 LABEL maintainer="go2432@wayne.edu"
 LABEL description="Preprocessing container for DICOM/NIfTI handling"
-LABEL version="1.3"
+LABEL version="1.4"
 WORKDIR /workspace
 # 1. Base System Dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -47,6 +47,11 @@ RUN pip install --no-cache-dir \
 # registration in future; for now SimpleITK rigid is sufficient.
 # Uncomment the line below if you want ANTs available in the container:
 # RUN pip install --no-cache-dir antspyx==0.4.2
+# 6. 3D visualization dependencies for 06_visualize_3d.py
+# plotly: interactive Mesh3d HTML output (marching cubes → browser viewer)
+# pandas/scikit-image/scipy/nibabel/numpy already present in layers 2-3
+RUN pip install --no-cache-dir \
+    plotly==5.18.0
 RUN mkdir -p /data /results
 ENV PYTHONUNBUFFERED=1
 CMD ["/bin/bash"]
