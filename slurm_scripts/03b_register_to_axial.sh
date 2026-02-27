@@ -14,9 +14,9 @@
 set -euo pipefail
 
 # ── Configuration — edit these to change behaviour ────────────────────────────
-TOP_N=1                    # studies from each end — must match 02b + 03b settings
+TOP_N=30                    # studies from each end — must match 02b + 03b settings
 RANK_BY=l5_s1_confidence   # column to rank by — must match 02b + 03b settings
-ALL=false                  # set to true to register every study in nifti_dir
+ALL=true                  # set to true to register every study in nifti_dir
 RETRY_FAILED=false
 # ─────────────────────────────────────────────────────────────────────────────
 
