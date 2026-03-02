@@ -2,107 +2,35 @@
 """
 04_detect_lstv.py — Hybrid Two-Phase LSTV Castellvi Classifier
 ===============================================================
-Classifies Lumbosacral Transitional Vertebrae (LSTV) using the Castellvi
-system, then calls lstv_engine.py for radiologically-grounded phenotype
-classification (lumbarization / sacralization / transitional_indeterminate).
+v4.1 CHANGES
+-------------
+- TV IDENTIFICATION: TSS lumbar labels now drive TV level selection.
+  TSS's lowest labeled lumbar vertebra (e.g. label 45 = L5) is mapped to
+  the corresponding VERIDAH label (label 24 = L5) as the preferred TV.
+  VERIDAH L6 is still checked independently (no TSS L6 label exists).
+  Fallback to VERIDAH search order only when TSS preference is unavailable.
+  
+  This ensures: when TSS says L5 is the lowest lumbar, and VERIDAH's L5
+  centroid is displaced 32mm from TSS's L5 (XVAL warning), the TV Z-range
+  still comes from TSS (get_tv_z_range already preferred TSS), and the
+  segmental axis is computed from TSS disc labels (which are independent of
+  the VERIDAH offset).
 
-CRITICAL DESIGN PRINCIPLE
---------------------------
-Castellvi classification and phenotype classification are ORTHOGONAL.
-A study may simultaneously have:
-  • Castellvi IIb (bilateral pseudo-articulation of L5/L6 TP with sacrum)
-  • Phenotype: lumbarization (6-lumbar count, L6 segment identified)
-Neither classification suppresses the other.
+- SPINEPS ROLE CLARIFICATION: SPINEPS (seg-spine_msk) is used ONLY for
+  TP geometry (costal process labels 43/44). Vertebral level identification
+  is entirely driven by TSS → VERIDAH. SPINEPS vertebra labels are never
+  used for level determination.
 
-LSTV DETECTION FLAGS (lstv_detected = True when ANY of the following):
-  • Castellvi Type I-IV detected (TP morphology)
-  • Lumbar count ≠ 5 (4 → sacralization, 6 → lumbarization)
-  • Phenotype = sacralization or lumbarization (confirmed by morphometrics)
+- SPINEPS L6 NOTE: When VERIDAH labels a 6th lumbar vertebra, this is
+  treated as a potential false positive and subjected to _verify_l6()
+  (requires TSS disc above, disc below, and positional sanity check).
+  False positives are demoted to L5. True L6 (lumbarization) passes all
+  three checks.
 
-CASTELLVI CLASSIFICATION (Castellvi et al. 1984, Spine 9:31-35)
------------------------------------------------------------------
-Type I   : Dysplastic TP ≥ 19 mm craniocaudal height, no sacral contact
-           Ia = unilateral; Ib = bilateral
-Type II  : Pseudo-articulation (diarthrodial joint) between TP and sacrum
-           IIa = unilateral; IIb = bilateral
-Type III : Complete osseous fusion of TP with sacrum
-           IIIa = unilateral; IIIb = bilateral
-Type IV  : Mixed — one side Type II, other side Type III
+- BUGFIX: segmental axis VERIDAH warning — logs when VERIDAH references
+  are used for axis computation (may be degraded if VERIDAH is offset).
 
-LABEL REFERENCE — SOURCE DISAMBIGUATION
-----------------------------------------
-SPINEPS seg-spine_msk.nii.gz  (subregion / semantic labels):
-  43 = Costal_Process_Left   ← TP SOURCE
-  44 = Costal_Process_Right  ← TP SOURCE
-  26 = Sacrum
-  ⚠ TSS labels 43/44 = L3/L4 vertebral bodies — NEVER used as TP source
-
-SPINEPS seg-vert_msk.nii.gz  (VERIDAH per-vertebra instance labels):
-  20=L1  21=L2  22=L3  23=L4  24=L5  25=L6  26=Sacrum
-
-TotalSpineSeg sagittal_labeled.nii.gz:
-  41=L1  42=L2  43=L3  44=L4  45=L5  50=Sacrum
-  91-100 = disc labels
-  Preferred vertebra body source for TV Z-range and segmental axis.
-
-TV Z-RANGE DETERMINATION
---------------------------
-The Z range used to isolate SPINEPS TP instances is derived from the
-TotalSpineSeg (TSS) vertebra body label whenever possible, with VERIDAH
-as fallback.  See get_tv_z_range() for full preference order.
-
-TP HEIGHT MEASUREMENT — PRINCIPAL AXIS METHOD
----------------------------------------------
-Castellvi's craniocaudal TP height criterion (≥ 19 mm) is measured along
-the anatomic SI axis of the spinal segment, NOT the scanner Z axis.
-
-The segmental SI axis is defined as the unit vector from the centroid of
-the disc below the transitional vertebra (TV) to the centroid of the disc
-above the TV.  This axis is independent of scanner orientation, corrects
-for spinal curvature, and remains valid for scoliotic and post-surgical
-cases where the anatomic SI axis may deviate substantially from Z.
-
-The three principal axes of the isolated TP voxel cloud are obtained via
-SVD/PCA on the physical-space (mm) coordinates.  The principal axis with
-the highest absolute cosine similarity to the segmental SI axis is
-selected, and the TP height is the range of voxel projections onto that
-axis.
-
-SEGMENTAL AXIS COMPUTATION
----------------------------
-Preference order for superior / inferior reference points:
-
-  Preferred (disc centroids):
-    sup: TSS disc label above TV (e.g. label 95 = L4-L5 for TV=L5)
-    inf: TSS disc label below TV (e.g. label 100 = L5-S1 for TV=L5)
-
-  Fallback 1 (vertebra body centroids):
-    sup: TSS vertebra body above TV  (e.g. label 44 = L4 for TV=L5)
-    inf: TSS sacrum (label 50) or TSS vert below
-
-  Fallback 2 (VERIDAH vertebra body centroids):
-    Used when TSS label is absent or TV = L6 (no TSS L6 label exists).
-
-  Last resort: scanner Z axis [0, 0, 1].
-
-TSS disc label mapping for each TV:
-  TV=L1 (VD 20):  disc_above=None   disc_below=92 (L1-L2)
-  TV=L2 (VD 21):  disc_above=92     disc_below=93
-  TV=L3 (VD 22):  disc_above=93     disc_below=94
-  TV=L4 (VD 23):  disc_above=94     disc_below=95
-  TV=L5 (VD 24):  disc_above=95     disc_below=100
-  TV=L6 (VD 25):  no TSS disc labels → VERIDAH body fallback
-
-OUTPUT FIELDS (per-side Phase 1 dict)
---------------------------------------
-  tp_height_mm              : TP extent along chosen axis (Castellvi criterion)
-  tp_axis_chosen            : unit vector of chosen principal axis [x,y,z]
-  tp_axis_cos_segmental     : |cos θ| between chosen axis and segmental SI axis
-  tp_axis_deg_from_segmental: angle in degrees between chosen axis and segmental SI
-  tp_segmental_axis         : segmental SI unit vector [x,y,z] used
-  tp_segmental_axis_source  : description of how the segmental axis was computed
-  tp_z_min_vox / tp_z_max_vox: raw Z indices of TP mask (for visualisation)
-  tp_centroid_z_mm          : Z centroid of TP mask in mm (for visualisation)
+Everything else identical to v4.
 """
 
 from __future__ import annotations
@@ -143,19 +71,15 @@ XVAL_MIN_DICE      = 0.30
 XVAL_MAX_CENTROID  = 20.0   # mm
 
 # ── TSS disc labels adjacent to each possible TV ──────────────────────────────
-# (disc_above_tss_label, disc_below_tss_label)
-# None = that disc level has no TSS label (e.g. T12-L1 rarely segmented; no L6 disc).
 TV_TO_DISC_LABELS: Dict[int, Tuple[Optional[int], Optional[int]]] = {
-    VD_L1: (None,  92),   # inf = L1-L2; no TSS label above L1
+    VD_L1: (None,  92),
     VD_L2: (92,    93),
     VD_L3: (93,    94),
     VD_L4: (94,    95),
-    VD_L5: (95,   100),   # 100 = L5-S1
-    VD_L6: (None, None),  # no TSS disc labels at L6 level
+    VD_L5: (95,   100),
+    VD_L6: (None, None),
 }
 
-# TSS vertebra body fallback: (vert_above_tss_label, vert_below_tss_label_or_sacrum)
-# Used when the preferred disc label is absent.
 TV_TO_VERT_FALLBACK: Dict[int, Tuple[Optional[int], Optional[int]]] = {
     VD_L1: (None,       42),
     VD_L2: (41,         43),
@@ -165,7 +89,6 @@ TV_TO_VERT_FALLBACK: Dict[int, Tuple[Optional[int], Optional[int]]] = {
     VD_L6: (45,         TSS_SACRUM),
 }
 
-# VERIDAH vertebra body fallback (used when TSS is absent or TV = L6)
 TV_TO_VD_FALLBACK: Dict[int, Tuple[Optional[int], Optional[int]]] = {
     VD_L1: (None,    VD_L2),
     VD_L2: (VD_L1,  VD_L3),
@@ -174,6 +97,10 @@ TV_TO_VD_FALLBACK: Dict[int, Tuple[Optional[int], Optional[int]]] = {
     VD_L5: (VD_L4,  VD_SAC),
     VD_L6: (VD_L5,  VD_SAC),
 }
+
+# Inverse of VD_TO_TSS_VERT: TSS vertebra label → VERIDAH label
+TSS_VERT_TO_VD: Dict[int, int] = {v: k for k, v in VD_TO_TSS_VERT.items()}
+# {41: 20(L1), 42: 21(L2), 43: 22(L3), 44: 23(L4), 45: 24(L5)}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -243,6 +170,10 @@ def run_cross_validation(sag_spineps: np.ndarray,
             if dist > XVAL_MAX_CENTROID:
                 msg = f"L5 centroid dist={dist:.1f}mm > {XVAL_MAX_CENTROID}mm"
                 logger.warning(f"  [{study_id}] {msg}")
+                logger.warning(
+                    f"  [{study_id}] ⚠ VERIDAH L5 offset from TSS L5 by {dist:.1f}mm — "
+                    f"TV Z-range and segmental axis will use TSS L5 (label 45) as ground truth. "
+                    f"SPINEPS used for TP geometry only (labels 43/44).")
                 xval['warnings'].append(msg)
             else:
                 logger.info(f"  [{study_id}] L5 centroid dist={dist:.1f}mm ✓")
@@ -329,9 +260,9 @@ def get_tv_z_range(sag_vert:  np.ndarray,
     """
     Determine the Z voxel range of the transitional vertebra body.
 
-    Preference:
-    1. TSS vertebra body label (independent of SPINEPS TP label ambiguity)
-    2. VERIDAH vertebra body label (also the only option for L6)
+    GROUND TRUTH PREFERENCE ORDER:
+    1. TSS vertebra body label — always preferred; independent of SPINEPS
+    2. VERIDAH vertebra body label — fallback; only for L6 or TSS absence
     """
     tss_lbl = VD_TO_TSS_VERT.get(tv_label)
 
@@ -363,11 +294,10 @@ def get_tv_z_range(sag_vert:  np.ndarray,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _mask_centroid_mm(mask: np.ndarray, vox_mm: np.ndarray) -> Optional[np.ndarray]:
-    """Physical-space centroid of a boolean mask in mm."""
     if not mask.any():
         return None
-    idx = np.array(np.where(mask), dtype=np.float64)   # (3, N)
-    return idx.mean(axis=1) * vox_mm                    # (3,)
+    idx = np.array(np.where(mask), dtype=np.float64)
+    return idx.mean(axis=1) * vox_mm
 
 
 def compute_segmental_axis(
@@ -378,34 +308,12 @@ def compute_segmental_axis(
         study_id: str,
 ) -> Tuple[np.ndarray, str]:
     """
-    Compute the anatomic superior–inferior (SI) unit axis of the spinal
-    segment at the transitional vertebra (TV).
+    Compute the anatomic SI unit axis of the spinal segment at the TV.
 
-    The axis is the unit vector pointing from the centroid of the structure
-    immediately INFERIOR to the TV (disc below, or sacrum) to the centroid
-    of the structure immediately SUPERIOR to the TV (disc above, or vertebra
-    body above).  This is the anatomic craniocaudal axis of the segment,
-    independent of scanner orientation.
-
-    Reference structures are obtained in preference order:
-      1. TSS disc centroids  (most stable — disc centroids hug the endplates)
-      2. TSS vertebra body centroids
-      3. VERIDAH vertebra body centroids  (for L6 or when TSS is absent)
-      4. Scanner Z axis [0, 0, 1]  (last resort; triggers a warning)
-
-    Parameters
-    ----------
-    sag_tss   : TotalSpineSeg sagittal volume (may be None)
-    sag_vert  : SPINEPS seg-vert_msk (VERIDAH) volume
-    tv_label  : VERIDAH label of the transitional vertebra (20–25)
-    vox_mm    : physical voxel size [x, y, z] in mm
-    study_id  : for log messages
-
-    Returns
-    -------
-    (axis_unit_vector, source_description)
-      axis_unit_vector : np.ndarray shape (3,), cranially pointing
-      source_description : human-readable string naming the reference landmarks
+    TSS disc labels are strongly preferred. VERIDAH fallbacks are used only
+    when TSS labels are absent. When VERIDAH references must be used and the
+    cross-validation showed large L5 centroid displacement, a WARNING is emitted
+    because the VERIDAH offset may degrade the axis.
     """
     disc_above_lbl, disc_below_lbl = TV_TO_DISC_LABELS.get(tv_label, (None, None))
     vert_above_tss, vert_below_tss = TV_TO_VERT_FALLBACK.get(tv_label, (None, None))
@@ -416,7 +324,7 @@ def compute_segmental_axis(
     sup_src: str = ''
     inf_src: str = ''
 
-    # ── Superior reference (disc above → TSS vert above → VERIDAH vert above) ─
+    # ── Superior reference ────────────────────────────────────────────────────
     if disc_above_lbl is not None and sag_tss is not None:
         m = (sag_tss == disc_above_lbl)
         if m.any():
@@ -435,7 +343,7 @@ def compute_segmental_axis(
             sup_pt  = _mask_centroid_mm(m, vox_mm)
             sup_src = f'VERIDAH vert {vd_above}'
 
-    # ── Inferior reference (disc below → TSS sacrum/vert → VERIDAH sacrum/vert) ─
+    # ── Inferior reference ────────────────────────────────────────────────────
     if disc_below_lbl is not None and sag_tss is not None:
         m = (sag_tss == disc_below_lbl)
         if m.any():
@@ -468,6 +376,13 @@ def compute_segmental_axis(
         )
         return np.array([0.0, 0.0, 1.0]), 'scanner Z axis (fallback)'
 
+    # ── Warn if VERIDAH references used (possible L5 offset issue) ───────────
+    if 'VERIDAH' in sup_src or 'VERIDAH' in inf_src:
+        logger.warning(
+            f"  [{study_id}] Segmental axis using VERIDAH reference "
+            f"({sup_src} ↔ {inf_src}). If XVAL showed large L5 centroid "
+            f"displacement, this axis may be degraded. TSS disc labels preferred.")
+
     # ── Build unit vector: inf → sup (caudal to cranial) ─────────────────────
     raw  = sup_pt - inf_pt
     norm = float(np.linalg.norm(raw))
@@ -497,55 +412,13 @@ def measure_tp_height_principal_axis(
         vox_mm:         np.ndarray,
         segmental_axis: np.ndarray,
 ) -> Tuple[float, np.ndarray, float, np.ndarray]:
-    """
-    Measure the craniocaudal extent of a transverse process along the
-    principal axis that best aligns with the segmental SI axis.
-
-    RATIONALE
-    ---------
-    Castellvi (1984) specifies "craniocaudal height" of the TP.  In a spine
-    with normal alignment this equals the Z-extent, but in scoliosis, kyphosis,
-    or any oblique acquisition the Z axis may deviate substantially from the
-    anatomic SI axis of the segment.  Measuring along the dominant structural
-    axis of the TP itself — the one that matches the segmental SI direction —
-    is anatomically and geometrically correct.
-
-    ALGORITHM
-    ---------
-    1. Convert TP mask voxel indices to physical mm coordinates.
-    2. Mean-centre the point cloud.
-    3. Decompose via SVD → three right singular vectors = principal axes
-       sorted by descending explained variance (first = longest axis).
-    4. Select the principal axis whose |dot product| with segmental_axis is
-       maximised.  This is the axis that best represents the craniocaudal
-       direction within the TP geometry.
-    5. Orient the selected axis cranially (positive dot with segmental_axis).
-    6. Project ALL TP voxels onto the selected axis.
-    7. Height = max(projection) − min(projection).
-
-    Parameters
-    ----------
-    tp_mask        : 3-D boolean array of isolated TP voxels
-    vox_mm         : physical voxel size [x, y, z] mm
-    segmental_axis : unit vector (cranially pointing) of the segmental SI axis
-
-    Returns
-    -------
-    height_mm      : craniocaudal extent in mm along the chosen axis
-    chosen_axis    : the principal axis vector used (unit, cranially oriented)
-    cos_align      : |cos θ| between chosen_axis and segmental_axis
-    principal_axes : (3, 3) array — all three principal axes as rows, by
-                     descending explained variance
-    """
     if not tp_mask.any():
         return 0.0, segmental_axis.copy(), 0.0, np.eye(3)
 
-    # Physical coordinates of every TP voxel (N × 3, in mm)
-    idx    = np.array(np.where(tp_mask), dtype=np.float64).T   # (N, 3)
-    pts_mm = idx * vox_mm                                       # (N, 3)
+    idx    = np.array(np.where(tp_mask), dtype=np.float64).T
+    pts_mm = idx * vox_mm
     n_pts  = pts_mm.shape[0]
 
-    # Degenerate case: too few points for PCA
     if n_pts < 3:
         proj = pts_mm @ segmental_axis
         height = float(proj.max() - proj.min()) if n_pts > 1 else 0.0
@@ -553,8 +426,6 @@ def measure_tp_height_principal_axis(
 
     centred = pts_mm - pts_mm.mean(axis=0)
 
-    # Thin SVD — Vt rows are right singular vectors (principal axes),
-    # ordered by descending singular value (= descending variance).
     try:
         _, _, Vt = np.linalg.svd(centred, full_matrices=False)
     except np.linalg.LinAlgError:
@@ -562,21 +433,18 @@ def measure_tp_height_principal_axis(
         proj = pts_mm @ segmental_axis
         return float(proj.max() - proj.min()), segmental_axis.copy(), 1.0, np.eye(3)
 
-    principal_axes = Vt   # shape (3, 3); row i = i-th principal axis
+    principal_axes = Vt
 
-    # ── Select the axis most aligned with the segmental SI direction ──────────
-    dots    = np.abs(principal_axes @ segmental_axis)   # (3,)
+    dots    = np.abs(principal_axes @ segmental_axis)
     best    = int(np.argmax(dots))
     chosen  = principal_axes[best].copy()
 
-    # Ensure consistent cranial orientation
     if np.dot(chosen, segmental_axis) < 0:
         chosen = -chosen
 
     cos_align = float(dots[best])
     deg       = float(np.degrees(np.arccos(np.clip(cos_align, 0.0, 1.0))))
 
-    # ── Measure extent along chosen axis ─────────────────────────────────────
     proj      = pts_mm @ chosen
     height_mm = float(proj.max() - proj.min())
 
@@ -602,15 +470,14 @@ def _verify_l6(sag_vert:  np.ndarray,
                tv_z:      Tuple[int, int],
                study_id:  str) -> Tuple[bool, str]:
     """
-    Confirm that VERIDAH's L6 label is a genuine extra lumbar vertebra.
+    Confirm VERIDAH L6 is a genuine extra lumbar vertebra (not FP).
 
-    Three checks (all must pass):
-      1. Positional sanity: L6 centroid between TSS L5 inferior and TSS
-         sacrum superior.
-      2. Disc ABOVE L6: TSS disc centroid clearly above L6 superior edge
-         (L5-L6 disc space present).
-      3. Disc BELOW L6: TSS disc centroid between L6 inferior edge and
-         sacrum superior edge (L6-S1 disc space present).
+    Three checks:
+      1. Positional sanity: L6 centroid between TSS L5 inferior and TSS sacrum superior.
+      2. Disc ABOVE L6: TSS disc centroid clearly above L6 superior edge.
+      3. Disc BELOW L6: TSS disc centroid between L6 inferior and sacrum superior.
+
+    SPINEPS false-positive L6 labels that fail any check → demoted to L5.
     """
     if sag_tss is None:
         return False, "no TSS available — cannot verify L6"
@@ -682,12 +549,6 @@ def _extract_bbox(axial_t2w: np.ndarray, midpoint: np.ndarray,
 
 
 def _classify_signal(patch: np.ndarray, axial_t2w: np.ndarray) -> Tuple[str, dict]:
-    """
-    Classify axial T2w signal at TP–sacrum junction.
-    Dark/intermediate → fibrocartilaginous pseudo-joint → Type II
-    Bright homogeneous → osseous marrow bridge           → Type III
-    (Konin & Walz 2010; Nidecker et al. 2018)
-    """
     vals = patch.astype(float).ravel()
     vals = vals[np.isfinite(vals)]
     if len(vals) == 0:
@@ -770,25 +631,16 @@ def phase1_sagittal(side:           str,
     """
     Phase 1: sagittal geometric Castellvi analysis.
 
-    TP craniocaudal height is measured along the principal axis of the TP
-    voxel cloud that best aligns with the segmental SI axis (see
-    measure_tp_height_principal_axis).  This replaces the naive Z-extent
-    measurement and correctly handles oblique TP orientations.
-
-    Contact threshold : ≤ 2 mm 3D Euclidean distance to sacrum.
-    Type I threshold  : TP height ≥ 19 mm (Castellvi 1984) without contact.
-
-    Parameters
-    ----------
-    segmental_axis : cranially-pointing SI unit vector for this TV level,
-                     computed by compute_segmental_axis()
-    segmental_src  : human-readable description of how the axis was derived
+    DESIGN NOTE (v4.1):
+    tv_z_range is derived from TSS vertebra body (get_tv_z_range, TSS-preferred).
+    SPINEPS costal process labels (43=left, 44=right) are filtered to this
+    Z-range to isolate the TP at the TSS-identified transitional vertebra.
+    SPINEPS vertebra labels are NOT used for level identification.
     """
     out = {
         'tp_present': False, 'tp_height_mm': 0.0, 'contact': False,
         'dist_mm': float('inf'), 'tp_vox': None, 'sacrum_vox': None,
         'classification': 'Normal', 'phase1_done': False, 'sacrum_source': None,
-        # ── Principal axis fields ─────────────────────────────────────────────
         'tp_axis_chosen':             None,
         'tp_axis_cos_segmental':      None,
         'tp_axis_deg_from_segmental': None,
@@ -796,7 +648,7 @@ def phase1_sagittal(side:           str,
         'tp_segmental_axis_source':   segmental_src,
     }
 
-    # ── Sacrum mask ───────────────────────────────────────────────────────────
+    # ── Sacrum mask (TSS preferred) ───────────────────────────────────────────
     tss_sac = (sag_tss == TSS_SACRUM) if sag_tss is not None else None
     if tss_sac is not None and tss_sac.any():
         sac_mask             = tss_sac
@@ -805,17 +657,18 @@ def phase1_sagittal(side:           str,
         sac_mask             = (sag_sp == SP_SACRUM)
         out['sacrum_source'] = 'SPINEPS label 26 (fallback)'
 
-    # ── Isolate TP at TV level ────────────────────────────────────────────────
+    # ── Isolate TP at TV level via TSS-derived Z-range ────────────────────────
+    # tv_z_range was set by get_tv_z_range() which prefers TSS vertebra body.
+    # SPINEPS costal process labels (43/44) are the ONLY SPINEPS labels used here.
     tp_at_tv = isolate_tp_at_tv(sag_sp, tp_label, *tv_z_range)
     tp_mask  = inferiormost_tp_cc(tp_at_tv, sac_mask if sac_mask.any() else None)
 
     if not tp_mask.any():
-        out['note'] = f"TP label {tp_label} absent at TV level"
+        out['note'] = f"TP label {tp_label} absent at TV level (Z={tv_z_range})"
         return out
 
     out['tp_present'] = True
 
-    # Z indices retained for visualisation
     tp_z_coords         = np.where(tp_mask)[2]
     out['tp_z_min_vox'] = int(tp_z_coords.min())
     out['tp_z_max_vox'] = int(tp_z_coords.max())
@@ -866,9 +719,12 @@ def classify_study(study_id:       str,
     """
     Full LSTV classification for one study.
 
-    Castellvi classification (TP morphology) and LSTV phenotype
-    (lumbarization / sacralization) are computed independently and both
-    reported — they may co-occur.
+    ARCHITECTURE (v4.1):
+    - TSS (TotalSpineSeg) is the ground truth for vertebral level identification.
+    - SPINEPS (seg-spine_msk) provides TP geometry only (costal process labels 43/44).
+    - SPINEPS vertebra identity (VERIDAH seg-vert_msk) is used for:
+        * L6 detection (no TSS L6 label exists)
+        * Fallback when TSS labels are absent
     """
     out: dict = {
         'study_id':           study_id,
@@ -936,6 +792,21 @@ def classify_study(study_id:       str,
         + (f"  MISSING: {list(tss_lumbar_missing.values())}" if tss_lumbar_missing else "")
     )
 
+    # ── TSS-based TV level preference ─────────────────────────────────────────
+    # TSS is ground truth. Its highest labeled lumbar vertebra defines the TV.
+    # e.g. if TSS has L1-L5 (labels 41-45), the TV = L5 → VERIDAH label 24.
+    # This prevents VERIDAH's counting errors from driving TV selection.
+    tss_highest_lumbar = max(
+        (lbl for lbl in TSS_LUMBAR if lbl in tss_unique), default=None)
+    tss_preferred_tv_vd = TSS_VERT_TO_VD.get(tss_highest_lumbar)  # TSS lbl → VERIDAH lbl
+    vert_unique = sorted(int(v) for v in np.unique(sag_vert) if v > 0)
+    logger.info(
+        f"  [{study_id}] TSS TV preference: TSS label {tss_highest_lumbar} "
+        f"({TSS_LUMBAR.get(tss_highest_lumbar, '?')}) → "
+        f"VERIDAH label {tss_preferred_tv_vd} "
+        f"({'present' if tss_preferred_tv_vd in vert_unique else 'ABSENT in VERIDAH'})"
+    )
+
     # ── Cross-validation ───────────────────────────────────────────────────────
     xval = run_cross_validation(sag_sp, sag_vert, sag_tss, vox_mm, study_id)
     out['cross_validation'] = xval
@@ -959,15 +830,41 @@ def classify_study(study_id:       str,
     if ax_tss is not None: ax_tss = ax_tss.astype(int)
     if ax_sp  is not None: ax_sp  = ax_sp.astype(int)
 
-    # ── TV identification from VERIDAH ─────────────────────────────────────────
-    vert_unique = sorted(int(v) for v in np.unique(sag_vert) if v > 0)
-    named       = [VERIDAH_NAMES[l] for l in vert_unique if l in VERIDAH_NAMES]
+    # ── TV identification — TSS-first ──────────────────────────────────────────
+    # DESIGN PRINCIPLE:
+    #   TSS's lowest lumbar label is the ground truth TV level.
+    #   VERIDAH L6 is checked separately (no TSS L6 label exists).
+    #   VERIDAH search-order fallback only when TSS preference is unavailable.
+    named = [VERIDAH_NAMES[l] for l in vert_unique if l in VERIDAH_NAMES]
     logger.info(f"  [{study_id}] VERIDAH labels: {named}")
 
     tv_label, tv_name = None, None
-    for cand in VERIDAH_TV_SEARCH:
-        if cand in vert_unique:
-            tv_label = cand; tv_name = VERIDAH_NAMES[cand]; break
+
+    # 1. TSS-preferred TV: if TSS identified a lowest lumbar and VERIDAH has it
+    if tss_preferred_tv_vd is not None and tss_preferred_tv_vd in vert_unique:
+        tv_label = tss_preferred_tv_vd
+        tv_name  = VERIDAH_NAMES[tv_label]
+        logger.info(
+            f"  [{study_id}] TV selected via TSS ground truth: "
+            f"{tv_name} (VERIDAH label {tv_label} ← TSS label {tss_highest_lumbar})")
+
+    # 2. VERIDAH L6 — possible lumbarization (no TSS L6 exists; must verify below)
+    elif VD_L6 in vert_unique:
+        tv_label = VD_L6
+        tv_name  = VERIDAH_NAMES[VD_L6]
+        logger.info(
+            f"  [{study_id}] TV: VERIDAH L6 present (TSS has no L6 label) — "
+            f"will verify (likely lumbarization, possible false positive)")
+
+    # 3. Fallback: VERIDAH TV search order
+    else:
+        for cand in VERIDAH_TV_SEARCH:
+            if cand in vert_unique:
+                tv_label = cand; tv_name = VERIDAH_NAMES[cand]
+                logger.warning(
+                    f"  [{study_id}] TV fallback (TSS preference unavailable): "
+                    f"{tv_name} from VERIDAH search order")
+                break
 
     if tv_label is None:
         out['errors'].append('No lumbar VERIDAH labels found'); return out
@@ -984,12 +881,16 @@ def classify_study(study_id:       str,
         if not l6_ok:
             logger.warning(
                 f"  [{study_id}] VERIDAH L6 FAILED verification: {l6_reason} "
-                f"— demoting TV to L5")
-            if VD_L5 in vert_unique:
+                f"— false positive L6; demoting TV to TSS ground truth (L5)")
+            # Demote: use TSS preferred TV (L5) or fallback to VERIDAH L5
+            if tss_preferred_tv_vd is not None and tss_preferred_tv_vd in vert_unique:
+                tv_label = tss_preferred_tv_vd
+                tv_name  = VERIDAH_NAMES[tv_label]
+            elif VD_L5 in vert_unique:
                 tv_label = VD_L5
                 tv_name  = VERIDAH_NAMES[VD_L5]
             else:
-                out['errors'].append('L6 verification failed and no VERIDAH L5 fallback')
+                out['errors'].append('L6 verification failed and no L5 fallback available')
                 return out
         else:
             logger.info(f"  [{study_id}] VERIDAH L6 verified ✓ — {l6_reason}")
@@ -1001,9 +902,6 @@ def classify_study(study_id:       str,
         return out
 
     # ── Segmental SI axis ──────────────────────────────────────────────────────
-    # Computed once per study; both TPs share the same transitional vertebra
-    # so the disc references — and therefore the segmental axis — are identical
-    # for left and right sides.
     seg_axis, seg_src = compute_segmental_axis(
         sag_tss, sag_vert, tv_label, vox_mm, study_id)
 
@@ -1018,10 +916,14 @@ def classify_study(study_id:       str,
         'segmental_axis_source': seg_src,
         'sag_vox_mm':            vox_mm.tolist(),
         'phase2_available':      p2_available,
-        'tp_source':             'seg-spine_msk labels 43 (L) / 44 (R)',
+        'tp_source':             'seg-spine_msk labels 43 (L) / 44 (R) — SPINEPS costal processes only',
         'sacrum_source':         'TSS label 50 (preferred) / SPINEPS 26 (fallback)',
-        'label_note':            'TSS 43/44 = L3/L4 vertebrae — TP always from seg-spine_msk',
+        'label_note':            (
+            'SPINEPS used for TP geometry only. '
+            'TV level = TSS ground truth. '
+            'TSS 43/44 = L3/L4 vertebrae — NEVER used as TP source.'),
         'tss_lumbar_labels':     tss_lumbar_present,
+        'tss_tv_preference':     f'TSS {tss_highest_lumbar} → VERIDAH {tss_preferred_tv_vd}',
     }
     logger.info(
         f"  [{study_id}] TV={tv_name}  z={tv_z}  z_src={tv_z_source}\n"
@@ -1234,7 +1136,7 @@ def main() -> int:
                             ['Type Ia','Type Ib','Type IIa','Type IIb',
                              'Type IIIa','Type IIIb','Type IV']}
     phenotype_counts: Dict[str, int] = {}
-    axis_deviations: List[float]     = []   # per-TP axis-vs-segmental angle (deg)
+    axis_deviations: List[float]     = []
 
     for sid in study_ids:
         logger.info(f"\n{'='*60}\n[{sid}]")

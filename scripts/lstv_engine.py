@@ -1,86 +1,16 @@
 #!/usr/bin/env python3
 """
-lstv_engine.py — LSTV Morphometrics Engine (Radiologically Grounded, v4)
-=========================================================================
-Single-responsibility module for all measurements needed to classify
-Lumbosacral Transitional Vertebrae (LSTV).
+lstv_engine.py — LSTV Morphometrics Engine (Radiologically Grounded, v4.1)
+===========================================================================
+CHANGES v4.1
+------------
+- FIX: assess_surgical_relevance() — added `ct = castellvi_type or ''` at
+  function scope to resolve NameError on the Bertolotti classification block.
+- NOTE: PRIOR_SACRALIZATION kept at 0.12 (Apazidis 2011, back-pain clinic).
+  If using a general population, consider 0.17 (Nardo 2012).
+  PRIOR_LUMBARIZATION kept at 0.04; general population ~0.02.
 
-WHAT'S NEW IN v4
------------------
-1. Bayesian probability model — reports P(sacralization), P(lumbarization),
-   P(normal) as posterior probabilities, not discrete labels.  Each
-   criterion contributes a log-likelihood-ratio update from a spine-clinic
-   prior (Apazidis 2011).
-
-2. Structured radiologic evidence list — every criterion that fires is
-   recorded as a RadiologicCriterion with value, direction, likelihood
-   ratio, and citable literature reference.
-
-3. Surgical relevance module — wrong-level surgery risk (0–1), nerve-root
-   naming ambiguity, Bertolotti's syndrome probability, level-counting
-   recommendation, approach considerations.  All with citations.
-
-4. Relative disc comparison — TV disc DHI compared to the disc above
-   (normalised ratio), removing scanner-to-scanner DHI variation.
-
-5. Multi-level vertebral body shape trend — TV H/AP vs L4 H/AP vs L3 H/AP
-   gradient to detect gradual caudal shortening (early sacralization).
-
-RADIOLOGIC DEFINITION OF LSTV
-------------------------------
-An LSTV is a congenital spinal anomaly in which the last mobile lumbar
-vertebra (the "transitional vertebra," TV) displays morphologic features
-intermediate between a lumbar and a sacral segment, resulting in either
-a lumbar-numbered vertebra acquiring sacral characteristics (sacralization)
-or a sacral segment acquiring lumbar mobility (lumbarization).
-
-Prevalence: 4–36% of the population depending on imaging modality and
-counting methodology (Konin & Walz 2010; Nardo et al. 2012).
-
-PROBABILITY MODEL
------------------
-Uses Bayesian log-odds updating with a spine-clinic prior:
-  P(sacralization) = 0.12  (Apazidis 2011, back-pain clinic cohort)
-  P(lumbarization) = 0.04
-Each criterion updates the log-odds by log(LR+) if positive or log(LR-)
-if negative.  LRs derived from Nardo 2012, Seyfert 1997, Castellvi 1984,
-Hughes & Saifuddin 2006, Konin 2010.  Results are renormalised to sum to 1.
-Probabilities should be interpreted at the population level, not as
-individual certainty.
-
-CASTELLVI CLASSIFICATION (Castellvi et al. 1984, Spine 9:31–35)
------------------------------------------------------------------
-Type I   : Dysplastic TP ≥ 19 mm CC height, no contact
-Type II  : Diarthrodial pseudo-articulation, MRI dark T2 (fibrocartilage)
-Type III : Complete osseous fusion, MRI bright T2 (marrow bridge)
-Type IV  : Mixed II/III
-
-DISC HEIGHT INDEX (DHI)
------------------------
-Farfan et al. 1972: DHI = disc_h / mean(sup+inf vert_h) × 100
-Normal ≥ 80%;  < 50% = most reliable sacralization criterion (Seyfert 1997)
-
-TV BODY MORPHOLOGY (Nardo 2012; Panjabi 1992)
-----------------------------------------------
-H/AP > 0.68 → lumbar-like;  0.52–0.68 → transitional;  < 0.52 → sacral-like
-
-REFERENCES
-----------
-Castellvi AE et al. Spine. 1984;9(1):31–35.
-Konin GP & Walz DM. Semin Musculoskelet Radiol. 2010;14(1):67–76.
-Nardo L et al. Radiology. 2012;265(2):497–503.
-Hughes RJ & Saifuddin A. Skeletal Radiol. 2006;35(5):299–316.
-Farshad-Amacker NA et al. Eur Spine J. 2014;23(2):396–402.
-Seyfert S. Neuroradiology. 1997;39(8):584–587.
-Quinlan JF et al. J Bone Joint Surg Br. 1984;66(4):556–558.
-Farfan HF et al. J Bone Joint Surg Am. 1972;54(3):492–510.
-Panjabi MM et al. Spine. 1992;17(3):299–306.
-Apazidis A et al. Spine. 2011;36(13):E854–E860.
-Andrasinova T et al. Pain Physician. 2018;21(4):333–342.
-Tokala DP et al. Eur Spine J. 2005;14(1):21–26.
-O'Brien MF et al. Spine. 2019;44(16):1171–1179.
-Luoma K et al. Spine. 2004;29(1):55–61.
-MacDonald DB. Spine. 2002;27(24):2886–2891.
+Everything else identical to v4.
 """
 
 from __future__ import annotations
@@ -144,20 +74,13 @@ EXPECTED_LUMBAR   = 5
 EXPECTED_THORACIC = 12
 
 # ── Bayesian probability model ─────────────────────────────────────────────────
-# Prior rates for a spine-clinic / clinical MRI population
-# Reference: Apazidis et al. 2011 Spine; Nardo et al. 2012 Radiology
 PRIOR_SACRALIZATION = 0.12
 PRIOR_LUMBARIZATION = 0.04
 
-# Likelihood ratios: (LR+_sac, LR-_sac, LR+_lumb, LR-_lumb)
-# LR+ = how much a positive finding increases the probability
-# LR- = how much a negative finding decreases the probability
-# Sources as noted in docstring
 _LR: Dict[str, Tuple[float, float, float, float]] = {
-    # name:                        (LR+sac, LR-sac, LR+lumb, LR-lumb)
     'count_4':              (28.0,  0.90,   0.10,   1.05),
     'count_6':              ( 0.10, 1.05,  22.0,   0.95),
-    'count_5':              ( 0.88, 1.00,   0.92,   1.00),   # mild against extremes
+    'count_5':              ( 0.88, 1.00,   0.92,   1.00),
     'castellvi_iii_iv':     ( 9.5,  0.70,   1.0,    1.0),
     'castellvi_ii':         ( 5.2,  0.75,   1.0,    1.0),
     'castellvi_i':          ( 2.8,  0.85,   1.0,    1.0),
@@ -165,13 +88,13 @@ _LR: Dict[str, Tuple[float, float, float, float]] = {
     'disc_dhi_lt50':        ( 5.8,  0.80,   0.20,   1.05),
     'disc_dhi_50_70':       ( 2.4,  0.90,   0.55,   1.02),
     'disc_dhi_70_80':       ( 1.5,  0.95,   0.80,   1.01),
-    'disc_below_normal':    ( 0.28, 1.05,   4.5,    0.80),   # preserved disc → lumb
+    'disc_below_normal':    ( 0.28, 1.05,   4.5,    0.80),
     'body_sacral_like':     ( 3.8,  0.82,   0.30,   1.08),
     'body_transitional':    ( 1.9,  0.92,   0.60,   1.05),
     'body_lumbar_like':     ( 0.38, 1.08,   3.2,    0.88),
     'tv_l4_norm_lt80':      ( 2.2,  0.90,   0.55,   1.04),
     'tv_l4_norm_gt95':      ( 0.55, 1.03,   2.5,    0.92),
-    'disc_ratio_low':       ( 3.5,  0.85,   0.40,   1.06),   # TV disc << L4-L5 disc
+    'disc_ratio_low':       ( 3.5,  0.85,   0.40,   1.06),
     'disc_above_normal':    ( 1.4,  0.92,   1.2,    0.98),
     'l6_disc_preserved':    ( 0.20, 1.05,   6.5,    0.80),
 }
@@ -214,9 +137,8 @@ class TVBodyShape:
     shape_class: Optional[str]   = None
     ref_l4_h_ap: Optional[float] = None
     norm_ratio:  Optional[float] = None
-    # v4 additions
-    ref_l3_h_ap:      Optional[float] = None  # L3 reference for gradient
-    caudal_gradient:  Optional[float] = None  # (L3→L4→TV) slope; negative = getting squarer
+    ref_l3_h_ap:      Optional[float] = None
+    caudal_gradient:  Optional[float] = None
     gradient_note:    Optional[str]   = None
     source:           Optional[str]   = None
 
@@ -235,143 +157,75 @@ class RibAnomalyResult:
 
 @dataclass
 class RadiologicCriterion:
-    """
-    Single radiologic criterion contributing to LSTV classification.
-
-    Structured for transparent probabilistic reporting and citation.
-    """
-    name:        str             # short key
-    value:       str             # measured value as string
-    direction:   str             # 'sacralization' | 'lumbarization' | 'normal' | 'supporting'
-    strength:    str             # 'primary' | 'secondary' | 'supporting' | 'against'
-    lr_sac:      float           # log-LR contribution to sacralization
-    lr_lumb:     float           # log-LR contribution to lumbarization
-    citation:    str             # citable reference
-    finding:     str             # human-readable finding for report
+    name:        str
+    value:       str
+    direction:   str
+    strength:    str
+    lr_sac:      float
+    lr_lumb:     float
+    citation:    str
+    finding:     str
 
 
 @dataclass
 class LSTVProbabilities:
-    """
-    Bayesian posterior probabilities for LSTV phenotype.
-
-    Computed by log-odds updating from a spine-clinic prior using
-    literature-derived likelihood ratios for each observed criterion.
-
-    Interpretation: P(sacralization) is the probability that this study
-    represents true sacralization given the observed morphometric findings
-    and a spine-clinic base rate of 12% (Apazidis 2011).
-
-    These are not calibrated prediction intervals — treat them as informed
-    probability estimates, not certainty scores.
-    """
-    p_sacralization:      float   # posterior P(sacralization)
-    p_lumbarization:      float   # posterior P(lumbarization)
-    p_normal:             float   # posterior P(normal/indeterminate)
-    p_transitional:       float   # P(Castellvi without primary phenotype)
-
-    # Evidence components
-    log_odds_sac_evidence:  float  # sum of log(LR) updates for sacralization
-    log_odds_lumb_evidence: float  # sum of log(LR) updates for lumbarization
-    n_criteria:             int    # number of criteria that fired
-
-    # Context
+    p_sacralization:      float
+    p_lumbarization:      float
+    p_normal:             float
+    p_transitional:       float
+    log_odds_sac_evidence:  float
+    log_odds_lumb_evidence: float
+    n_criteria:             int
     prior_sacralization: float = PRIOR_SACRALIZATION
     prior_lumbarization: float = PRIOR_LUMBARIZATION
     dominant_class:      str   = ''
-    confidence_pct:      float = 0.0   # probability of dominant class (%)
+    confidence_pct:      float = 0.0
     calibration_note:    str   = ''
 
 
 @dataclass
 class SurgicalRelevance:
-    """
-    Neurosurgically relevant findings derived from LSTV morphometrics.
-
-    Primary concern: LSTV is the most common identifiable cause of
-    wrong-level spinal surgery.  Reported discrepancy rate: 10–15% of
-    lumbar cases without dedicated LSTV imaging protocol
-    (Tokala 2005; O'Brien 2019).
-
-    All fields are populated by assess_surgical_relevance().
-    """
-    # ── Level identification risk ─────────────────────────────────────────────
-    wrong_level_risk:        str   = 'low'     # low / moderate / high / critical
-    wrong_level_risk_pct:    float = 0.05      # P(level error) if not explicitly verified
+    wrong_level_risk:        str   = 'low'
+    wrong_level_risk_pct:    float = 0.05
     level_ambiguity_note:    str   = ''
-
-    # ── Nerve root naming ─────────────────────────────────────────────────────
     nerve_root_ambiguity:    bool  = False
     nerve_root_note:         str   = ''
-
-    # ── Bertolotti's syndrome ─────────────────────────────────────────────────
-    # Andrasinova 2018: ~4-8% of young adult LBP attributable to LSTV
     bertolotti_probability:  float      = 0.0
     bertolotti_criteria:     List[str]  = field(default_factory=list)
-
-    # ── Surgical planning ─────────────────────────────────────────────────────
     surgical_flags:                 List[str] = field(default_factory=list)
     approach_considerations:        List[str] = field(default_factory=list)
     recommended_counting_method:    str       = ''
     intraop_neuromonitoring_note:   str       = ''
     level_identification_protocol:  str       = ''
-    calibration_note:               str       = ''   # set to non-empty if fallback was used
+    calibration_note:               str       = ''
 
 
 @dataclass
 class LSTVMorphometrics:
-    """
-    Complete LSTV morphometric result for one study.
-
-    v4: adds probability model, surgical relevance, structured evidence list,
-    relative disc comparison, vertebral body gradient.
-    """
     study_id: str
     error:    Optional[str] = None
-
-    # ── Lumbar count ──────────────────────────────────────────────────────────
     lumbar_count_tss:       Optional[int] = None
     lumbar_count_veridah:   Optional[int] = None
     lumbar_count_consensus: Optional[int] = None
     lumbar_count_anomaly:   bool          = False
     lumbar_count_note:      Optional[str] = None
-
-    # ── TV identification ─────────────────────────────────────────────────────
     tv_label_veridah:  Optional[int] = None
     tv_name:           Optional[str] = None
     tv_tss_label:      Optional[int] = None
     has_l6:            bool          = False
-
-    # ── TV body shape (including v4 gradient) ─────────────────────────────────
     tv_shape:  Optional[TVBodyShape] = None
-
-    # ── Adjacent disc metrics ─────────────────────────────────────────────────
     disc_above: Optional[DiscMetrics] = None
     disc_below: Optional[DiscMetrics] = None
-
-    # ── v4: Relative disc comparison ─────────────────────────────────────────
-    # Ratio of TV-disc DHI to disc-above DHI — corrects for scanner variation.
-    # < 0.65 strongly supports sacralization (Farshad-Amacker 2014)
     relative_disc_ratio: Optional[float] = None
     relative_disc_note:  Optional[str]   = None
-
-    # ── Rib anomaly ───────────────────────────────────────────────────────────
     rib_anomaly: Optional[RibAnomalyResult] = None
-
-    # ── LSTV phenotype (discrete) ─────────────────────────────────────────────
     lstv_phenotype:       Optional[str] = None
     phenotype_confidence: Optional[str] = None
     phenotype_criteria:   List[str]     = field(default_factory=list)
     phenotype_rationale:  Optional[str] = None
     primary_criteria_met: List[str]     = field(default_factory=list)
-
-    # ── v4: Probability model ─────────────────────────────────────────────────
     probabilities:         Optional[LSTVProbabilities]     = None
-
-    # ── v4: Structured radiologic evidence ────────────────────────────────────
     radiologic_evidence:   List[RadiologicCriterion]       = field(default_factory=list)
-
-    # ── v4: Surgical relevance ────────────────────────────────────────────────
     surgical_relevance:    Optional[SurgicalRelevance]     = None
 
     def to_dict(self) -> dict:
@@ -532,13 +386,6 @@ def _vert_shape(iso: np.ndarray, vert_label: int,
 def analyze_tv_body_shape(masks: LSTVMaskSet,
                            tv_veridah_label: int,
                            tv_tss_label: Optional[int]) -> TVBodyShape:
-    """
-    Analyse TV body morphology and compute caudal gradient.
-
-    v4: Adds L3 reference for three-level H/AP gradient (L3 → L4 → TV).
-    A steep negative gradient (TV much squarer than L3 and L4) supports
-    progressive sacral incorporation (Nardo 2012).
-    """
     shape: Optional[TVBodyShape] = None
     if tv_tss_label is not None and masks.tss_iso is not None:
         shape = _vert_shape(masks.tss_iso, tv_tss_label, 'TSS')
@@ -547,7 +394,6 @@ def analyze_tv_body_shape(masks: LSTVMaskSet,
     if shape is None:
         return TVBodyShape()
 
-    # L4 reference (primary normalisation)
     l4_shape: Optional[TVBodyShape] = None
     if masks.tss_iso is not None and 44 in masks.tss_labels:
         l4_shape = _vert_shape(masks.tss_iso, 44, 'TSS')
@@ -557,7 +403,6 @@ def analyze_tv_body_shape(masks: LSTVMaskSet,
         shape.ref_l4_h_ap = l4_shape.h_ap_ratio
         shape.norm_ratio  = round(shape.h_ap_ratio / l4_shape.h_ap_ratio, 3)
 
-    # L3 reference (v4: gradient computation)
     l3_shape: Optional[TVBodyShape] = None
     if masks.tss_iso is not None and 43 in masks.tss_labels:
         l3_shape = _vert_shape(masks.tss_iso, 43, 'TSS')
@@ -566,7 +411,6 @@ def analyze_tv_body_shape(masks: LSTVMaskSet,
     if (l3_shape and l3_shape.h_ap_ratio and l4_shape and l4_shape.h_ap_ratio
             and shape.h_ap_ratio):
         shape.ref_l3_h_ap = l3_shape.h_ap_ratio
-        # Linear gradient across 3 levels: slope of H/AP vs level index
         vals = [l3_shape.h_ap_ratio, l4_shape.h_ap_ratio, shape.h_ap_ratio]
         xs   = [0, 1, 2]
         n    = len(xs)
@@ -575,7 +419,6 @@ def analyze_tv_body_shape(masks: LSTVMaskSet,
         slope = (n * sxy - sx * sy) / (n * sx2 - sx * sx + 1e-9)
         shape.caudal_gradient = round(float(slope), 4)
 
-        # Interpret gradient
         if slope < -0.04:
             shape.gradient_note = (
                 f"Steep caudal H/AP gradient ({slope:.3f}/level): "
@@ -680,16 +523,6 @@ def get_tv_adjacent_discs(masks: LSTVMaskSet,
 
 def compute_relative_disc_ratio(disc_above: Optional[DiscMetrics],
                                   disc_below: Optional[DiscMetrics]) -> Tuple[Optional[float], str]:
-    """
-    Compute TV-disc DHI / above-disc DHI ratio.
-
-    Corrects for scanner-dependent DHI variation.  Ratio < 0.65 is a strong
-    sacralization criterion even when absolute DHI is in the 'moderate' range,
-    because it shows localised height loss specifically at the TV-sacrum junction
-    (Farshad-Amacker et al. 2014, Eur Spine J).
-
-    Returns (ratio, note).
-    """
     if disc_above is None or disc_below is None:
         return None, 'Adjacent disc data unavailable for ratio computation'
     if disc_above.dhi_pct is None or disc_below.dhi_pct is None:
@@ -786,7 +619,6 @@ def _sigmoid(lo: float) -> float:
 
 def _apply_lr(lo_sac: float, lo_lumb: float,
               key: str, positive: bool = True) -> Tuple[float, float, float, float]:
-    """Apply a named LR update to both log-odds.  Returns updated (lo_sac, lo_lumb, delta_sac, delta_lumb)."""
     lr_ps, lr_ns, lr_pl, lr_nl = _LR[key]
     if positive:
         ds = np.log(lr_ps); dl = np.log(lr_pl)
@@ -803,14 +635,6 @@ def compute_lstv_probability(
         disc_below:     Optional[DiscMetrics],
         rel_disc_ratio: Optional[float] = None,
 ) -> Tuple[LSTVProbabilities, List[RadiologicCriterion]]:
-    """
-    Bayesian posterior probability for LSTV phenotype classification.
-
-    Starts from a spine-clinic prior (Apazidis 2011) and updates
-    log-odds using likelihood ratios derived from landmark LSTV studies.
-
-    Returns (LSTVProbabilities, List[RadiologicCriterion]).
-    """
     lo_sac  = _log_odds(PRIOR_SACRALIZATION)
     lo_lumb = _log_odds(PRIOR_LUMBARIZATION)
     evidence_sac  = 0.0
@@ -821,7 +645,6 @@ def compute_lstv_probability(
     has_castellvi = bool(castellvi_type and castellvi_type not in ('None', None))
     ct = castellvi_type or ''
 
-    # ── Lumbar count ─────────────────────────────────────────────────────────
     if lumbar_count == 4:
         lo_sac, lo_lumb, ds, dl = _apply_lr(lo_sac, lo_lumb, 'count_4')
         evidence_sac += ds; evidence_lumb += dl; n_fired += 1
@@ -850,7 +673,6 @@ def compute_lstv_probability(
             citation='Apazidis A et al. Spine. 2011;36(13):E854–E860',
             finding='5 lumbar vertebrae — normal count (mild evidence against extreme phenotypes)'))
 
-    # ── Castellvi ────────────────────────────────────────────────────────────
     if has_castellvi:
         if any(x in ct for x in ('III', 'IV')):
             key = 'castellvi_iii_iv'
@@ -870,7 +692,6 @@ def compute_lstv_probability(
             citation='Castellvi AE et al. Spine. 1984;9(1):31–35; Konin GP & Walz DM. Semin Musculoskelet Radiol. 2010;14(1):67–76',
             finding=desc))
 
-    # ── Disc below ───────────────────────────────────────────────────────────
     if disc_below:
         dhi = disc_below.dhi_pct
         level = disc_below.level
@@ -911,7 +732,6 @@ def compute_lstv_probability(
                 citation='Seyfert S. Neuroradiology. 1997; Farfan HF et al. J Bone Joint Surg Am. 1972; Konin GP & Walz DM. 2010',
                 finding=finding))
 
-    # ── Relative disc ratio ───────────────────────────────────────────────────
     if rel_disc_ratio is not None and disc_above is not None and disc_above.dhi_pct:
         if rel_disc_ratio < 0.65:
             lo_sac, lo_lumb, ds, dl = _apply_lr(lo_sac, lo_lumb, 'disc_ratio_low')
@@ -924,7 +744,6 @@ def compute_lstv_probability(
                 finding=(f'TV-disc / above-disc DHI ratio = {rel_disc_ratio:.2f} < 0.65 — '
                          f'disproportionate lumbosacral narrowing localised to TV level (Farshad-Amacker 2014)')))
 
-    # ── TV body shape ─────────────────────────────────────────────────────────
     if tv_shape and tv_shape.h_ap_ratio:
         sc = tv_shape.shape_class
         h_ap = tv_shape.h_ap_ratio
@@ -974,19 +793,17 @@ def compute_lstv_probability(
                     finding=(f'TV/L4 normalised H:AP={nr:.2f} > 0.95 with L6 present — '
                              f'TV body resembles L4/L5 in morphology (supports lumbarization)')))
 
-        # Caudal gradient (v4)
         if tv_shape.caudal_gradient is not None:
             grad = tv_shape.caudal_gradient
             if grad < -0.04:
                 criteria.append(RadiologicCriterion(
                     name='caudal_body_gradient', value=f'{grad:.4f}/level',
                     direction='sacralization', strength='supporting',
-                    lr_sac=0.0, lr_lumb=0.0,   # informational only, not LR-weighted
+                    lr_sac=0.0, lr_lumb=0.0,
                     citation='Nardo L et al. Radiology. 2012',
                     finding=(f'Caudal H/AP gradient = {grad:.3f}/level '
                              f'(L3→L4→TV progressive shortening — supports sacral incorporation)')))
 
-    # ── Disc above ────────────────────────────────────────────────────────────
     if disc_above and disc_above.dhi_pct and disc_above.dhi_pct >= DHI_MILD_PCT:
         lo_sac, lo_lumb, ds, dl = _apply_lr(lo_sac, lo_lumb, 'disc_above_normal')
         evidence_sac += ds; n_fired += 1
@@ -998,18 +815,15 @@ def compute_lstv_probability(
             finding=(f'Disc above TV ({disc_above.level}) normal: DHI={disc_above.dhi_pct:.0f}% — '
                      f'localises pathology to lumbosacral junction')))
 
-    # ── Convert to probabilities ──────────────────────────────────────────────
     p_sac  = _sigmoid(lo_sac)
     p_lumb = _sigmoid(lo_lumb)
     p_norm = max(0.0, 1.0 - p_sac - p_lumb)
 
-    # Transitional: Castellvi + count=5 + preserved disc → Castellvi incidental
     p_transit = 0.0
     if (has_castellvi and lumbar_count == 5
             and disc_below and disc_below.dhi_pct and disc_below.dhi_pct >= DHI_REDUCED_PCT):
         p_transit = min(0.25, p_sac * 0.35)
 
-    # Renormalise
     total = p_sac + p_lumb + max(0.001, p_norm)
     p_sac  = round(p_sac  / total, 4)
     p_lumb = round(p_lumb / total, 4)
@@ -1051,38 +865,13 @@ def assess_surgical_relevance(
         disc_below:     Optional[DiscMetrics],
         tv_shape:       Optional[TVBodyShape],
 ) -> SurgicalRelevance:
-    """
-    Neurosurgical relevance assessment derived from LSTV morphometrics.
-
-    LSTV is the most common identifiable cause of wrong-level spinal surgery.
-    Wrong-level rate in lumbar surgery without specific LSTV protocol:
-    10–15% (Tokala 2005; O'Brien 2019).
-
-    This function generates:
-    1. Wrong-level surgery risk probability
-    2. Nerve root naming ambiguity assessment
-    3. Bertolotti's syndrome probability
-    4. Surgical flags and approach considerations
-    5. Level identification protocol recommendation
-
-    References
-    ----------
-    Tokala DP et al. Eur Spine J. 2005;14(1):21–26.
-    O'Brien MF et al. Spine. 2019;44(16):1171–1179.
-    Andrasinova T et al. Pain Physician. 2018;21(4):333–342.
-    Quinlan JF et al. J Bone Joint Surg Br. 1984;66(4):556–558.
-    Luoma K et al. Spine. 2004;29(1):55–61.
-    MacDonald DB. Spine. 2002;27(24):2886–2891.
-    Farshad-Amacker NA et al. Eur Spine J. 2014;23(2):396–402.
-    """
     sr = SurgicalRelevance()
     has_lstv      = phenotype in ('sacralization', 'lumbarization', 'transitional_indeterminate')
     has_castellvi = bool(castellvi_type and castellvi_type not in ('None', None))
+    ct            = castellvi_type or ''   # ← FIX v4.1: was missing, caused NameError
     p_dominant    = max(probs.p_sacralization, probs.p_lumbarization)
 
     # ── Wrong-level surgery risk ───────────────────────────────────────────────
-    # Base rate without LSTV: ~5% (O'Brien 2019 — imaging or counting errors)
-    # LSTV multiplies this by phenotype severity
     if not has_lstv and not has_castellvi:
         sr.wrong_level_risk     = 'low'
         sr.wrong_level_risk_pct = 0.05
@@ -1158,7 +947,7 @@ def assess_surgical_relevance(
             '⚠  MANDATORY: Count from S1 upward. '
             'Identify sacrum on fluoroscopy BEFORE counting lumbar levels.')
     if has_castellvi:
-        bilateral = 'b' in (castellvi_type or '').lower()
+        bilateral = 'b' in ct.lower()
         if bilateral:
             flags.append(
                 f'Bilateral Castellvi {castellvi_type}: pseudo-bilateral sacral fixation '
@@ -1174,7 +963,7 @@ def assess_surgical_relevance(
             f'TV disc severely narrowed (DHI={disc_below.dhi_pct:.0f}%): '
             f'ALIF/TLIF cage selection and lordosis targets require adjustment '
             f'for collapsed disc space geometry.')
-    if has_castellvi and any(x in (castellvi_type or '') for x in ('III', 'IV')):
+    if has_castellvi and any(x in ct for x in ('III', 'IV')):
         flags.append(
             'Castellvi III/IV: complete TP-sacrum bony fusion present. '
             'Pedicle screw trajectory at TV level may be altered by fused TP mass. '
@@ -1204,12 +993,12 @@ def assess_surgical_relevance(
         approach.append(
             'ALIF at TV-sacrum junction: true S1 endplate must be confirmed — '
             'the sacral promontory position may be more cephalad than expected.')
-    if has_castellvi and 'II' in (castellvi_type or ''):
+    if has_castellvi and 'II' in ct:
         approach.append(
             'Type II pseudo-joint: fibrocartilaginous TP-sacrum joint may cause '
             'ipsilateral foraminal narrowing. Decompression may require resection '
             'of the pseudo-joint to achieve full neural decompression (Luoma 2004).')
-    if has_castellvi and 'III' in (castellvi_type or ''):
+    if has_castellvi and 'III' in ct:
         approach.append(
             'Type III bony fusion: complete TP-sacrum bridge may need osteotomy '
             'for adequate exposure of the lumbosacral junction. '
@@ -1256,7 +1045,7 @@ def assess_surgical_relevance(
     p_bert = 0.0
     if has_castellvi:
         p_base = {'iii_iv': 0.60, 'ii': 0.50, 'i': 0.30}.get(
-            'iii_iv' if any(x in ct for x in ('III','IV')) else
+            'iii_iv' if any(x in ct for x in ('III', 'IV')) else
             'ii' if 'II' in ct else 'i', 0.30)
         p_bert += p_base
         bert_crit.append(
@@ -1284,7 +1073,7 @@ def assess_surgical_relevance(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# LSTV PHENOTYPE CLASSIFICATION (discrete — for backward compatibility)
+# LSTV PHENOTYPE CLASSIFICATION (discrete)
 # ═════════════════════════════════════════════════════════════════════════════
 
 def classify_lstv_phenotype(
@@ -1295,14 +1084,6 @@ def classify_lstv_phenotype(
         disc_above:     Optional[DiscMetrics],
         disc_below:     Optional[DiscMetrics],
 ) -> Tuple[str, str, List[str], str, List[str]]:
-    """
-    Classify LSTV phenotype using multi-criteria radiologic approach.
-
-    Returns (phenotype, confidence, criteria_text, rationale, primary_list).
-    In v4 this is kept for backward compatibility and human-readable output,
-    but the authoritative classification comes from the Bayesian probability
-    model in compute_lstv_probability().
-    """
     criteria:  List[str] = []
     primary:   List[str] = []
     sac_score  = 0
@@ -1376,7 +1157,6 @@ def classify_lstv_phenotype(
     if disc_above and disc_above.dhi_pct and disc_above.dhi_pct >= DHI_MILD_PCT:
         criteria.append(f"Disc above ({disc_above.level}) normal — DHI={disc_above.dhi_pct:.0f}% (localises to junction)")
 
-    # ── Decision tree ─────────────────────────────────────────────────────────
     if lumbar_count == 6:
         phenotype  = 'lumbarization'
         confidence = 'high'
@@ -1432,12 +1212,6 @@ def _fallback_surgical_relevance(
         phenotype:      Optional[str],
         disc_below:     Optional['DiscMetrics'],
 ) -> SurgicalRelevance:
-    """
-    Minimal SurgicalRelevance derived from top-level fields only.
-
-    Used when assess_surgical_relevance() cannot run (e.g. probability model
-    unavailable).  Guarantees the JSON always has a usable risk level.
-    """
     sr = SurgicalRelevance()
     has_castellvi = bool(castellvi_type and castellvi_type not in ('None', None))
 
@@ -1459,10 +1233,9 @@ def _fallback_surgical_relevance(
 
     sr.nerve_root_ambiguity = (lumbar_count != EXPECTED_LUMBAR or has_castellvi)
 
-    # Bertolotti estimate
+    ct = castellvi_type or ''
     p_bert = 0.0
     if has_castellvi:
-        ct = castellvi_type or ''
         p_bert = (0.60 if any(x in ct for x in ('III', 'IV'))
                   else 0.50 if 'II' in ct else 0.30)
     elif phenotype in ('sacralization', 'lumbarization'):
@@ -1483,21 +1256,9 @@ def _fallback_surgical_relevance(
 
 def analyze_lstv(masks: LSTVMaskSet,
                  castellvi_result: Optional[dict] = None) -> LSTVMorphometrics:
-    """
-    Run complete LSTV morphometric analysis (v4).
-
-    Outputs include:
-    - Discrete phenotype classification (backward compatible)
-    - Bayesian posterior probabilities for all phenotype classes
-    - Structured radiologic evidence list with citations
-    - Surgical relevance assessment for neurosurgical planning
-    - Relative disc ratio (Farshad-Amacker 2014)
-    - Vertebral body H/AP caudal gradient (Nardo 2012)
-    """
     result = LSTVMorphometrics(study_id=masks.study_id)
 
     try:
-        # 1. Lumbar count
         tss_safe             = masks.tss_iso if masks.tss_iso is not None else np.array([], dtype=np.int32)
         tss_count, tss_names = count_lumbar_tss(tss_safe, masks.tss_labels)
         vd_count,  vd_names  = count_lumbar_veridah(masks.vert_labels)
@@ -1510,7 +1271,6 @@ def analyze_lstv(masks: LSTVMaskSet,
         result.lumbar_count_anomaly   = (consensus != EXPECTED_LUMBAR)
         result.lumbar_count_note      = count_note
 
-        # 2. TV identification
         tv_label, tv_name = None, None
         for cand in VERIDAH_TV_SEARCH:
             if cand in masks.vert_labels:
@@ -1524,21 +1284,16 @@ def analyze_lstv(masks: LSTVMaskSet,
         result.has_l6           = (tv_label == VD_L6)
         result.tv_tss_label     = VD_TO_TSS_VERT.get(tv_label)
 
-        # 3. TV body shape (v4: includes L3 gradient)
         result.tv_shape = analyze_tv_body_shape(masks, tv_label, result.tv_tss_label)
 
-        # 4. Adjacent disc metrics
         result.disc_above, result.disc_below = get_tv_adjacent_discs(
             masks, tv_label, result.tv_tss_label)
 
-        # 5. Relative disc ratio (v4)
         result.relative_disc_ratio, result.relative_disc_note = \
             compute_relative_disc_ratio(result.disc_above, result.disc_below)
 
-        # 6. Rib anomaly
         result.rib_anomaly = detect_rib_anomaly(masks)
 
-        # 7. Discrete phenotype classification
         castellvi_type = None
         if castellvi_result:
             castellvi_type = castellvi_result.get('castellvi_type')
@@ -1556,7 +1311,6 @@ def analyze_lstv(masks: LSTVMaskSet,
             disc_below     = result.disc_below,
         )
 
-        # 8. Bayesian probability model (v4)
         try:
             result.probabilities, result.radiologic_evidence = compute_lstv_probability(
                 lumbar_count   = consensus,
@@ -1570,9 +1324,7 @@ def analyze_lstv(masks: LSTVMaskSet,
             import traceback as _tb
             logger.error(f"  [{masks.study_id}] STEP 8 (probability model) FAILED: {exc}")
             logger.error(_tb.format_exc())
-            # result.probabilities stays None; step 9 will use fallback
 
-        # 9. Surgical relevance (v4)
         try:
             if result.probabilities is not None:
                 result.surgical_relevance = assess_surgical_relevance(
@@ -1614,7 +1366,6 @@ def analyze_lstv(masks: LSTVMaskSet,
         result.error = str(exc)
         logger.error(f"  [{masks.study_id}] lstv_engine FATAL error: {exc}")
         logger.error(_tb.format_exc())
-        # Guarantee a usable surgical_relevance even on catastrophic failure
         if result.surgical_relevance is None:
             result.surgical_relevance = _fallback_surgical_relevance(
                 lumbar_count   = result.lumbar_count_consensus or EXPECTED_LUMBAR,
@@ -1633,20 +1384,6 @@ def analyze_lstv(masks: LSTVMaskSet,
 
 def compute_lstv_pathology_score(detect_result: dict,
                                   morpho_result: Optional[dict] = None) -> float:
-    """
-    Scalar LSTV pathology burden score for study ranking.
-
-    v4: Adds probability-weighted component (+2 if P(dominant) > 0.85).
-
-    Castellvi:           IV=5  III=4  II=3  I=1
-    Phenotype (high):    +3;  Phenotype (moderate): +2;  Transitional: +1
-    Probability boost:   P(dominant) > 0.85 → +2;  > 0.70 → +1
-    Lumbar count anomaly: +2
-    Disc below DHI < 50%: +2  |  < 70%: +1
-    Relative disc ratio < 0.65: +1
-    TV body sacral-like: +2  |  transitional: +1
-    Rib anomaly: +1
-    """
     score = 0.0
 
     ct = detect_result.get('castellvi_type') or ''
@@ -1665,7 +1402,6 @@ def compute_lstv_pathology_score(detect_result: dict,
     elif ph == 'transitional_indeterminate':
         score += 1.0
 
-    # Probability boost (v4)
     probs = morpho_result.get('probabilities') or {}
     p_dom = max(probs.get('p_sacralization', 0), probs.get('p_lumbarization', 0))
     if p_dom > 0.85:   score += 2.0
