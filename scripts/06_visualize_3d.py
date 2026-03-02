@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
 """
-06_visualize_3d.py — LSTV-Focused Interactive 3D Spine Viewer (v3)
+06_visualize_3d.py — LSTV-Focused Interactive 3D Spine Viewer (v3.1)
 ==============================================================
 Renders 3D interactive HTML for LSTV cases.
 
-CHANGES v3
+CHANGES v3.1
 ----------
+  • COLOR CONFLICT FIX:
+       TP-Left  = #00ccff (cyan)    — was #ff3333 (red, clashed with TSS sacrum)
+       TP-Right = #ff6600 (orange)
+       TSS Sacrum = #ff8c00 — now unambiguous
   • Focused view (default): L4/L5/L6/Sacrum + TPs + all rulers.
     "Full" button reveals the rest (L1–L3, arcus, cord, canal, …).
   • Bounding boxes: dashed wireframe around Castellvi-positive TPs,
     L6 body (lumbarization), estimated L5 zone (4-lumbar sacralization).
   • Increased vertebra opacity for visual clarity.
-  • Larger fonts throughout the HTML report.
   • Dynamic clinical narrative paragraphs in the side panel.
+  • Bayesian probability model bars in side panel.
+  • Surgical relevance / wrong-level risk section.
 
 TP CONCORDANCE CORRECTION
 --------------------------
@@ -88,13 +93,18 @@ PHENOTYPE_CONFIG = {
     },
 }
 
-# ── Mesh label tables — updated opacities for better clarity ──────────────────
+# ── Mesh label tables ──────────────────────────────────────────────────────────
+# COLOR FIX v3.1:
+#   TP-Left  was #ff3333 (red) — clashed with sacralization phenotype & TSS sacrum
+#             now #00ccff (cyan)
+#   TP-Right was #00ccff (cyan) — now #ff6600 (orange)
+#   TSS Sacrum stays #ff8c00 — now unambiguous from both TPs
 SPINE_LABELS: List[Tuple] = [
     (SP_SACRUM, 'Sacrum (spine)',    '#ff8c00', 0.80, True,  1.5),
     (SP_ARCUS,  'Arcus Vertebrae',   '#7744bb', 0.60, True,  1.5),
     (SP_SPINOUS,'Spinous Processes', '#d4b830', 0.65, True,  1.5),
-    (SP_TP_L,   'TP Left',           '#ff3333', 0.95, False, 0.8),
-    (SP_TP_R,   'TP Right',          '#00ccff', 0.95, False, 0.8),
+    (SP_TP_L,   'TP Left',           '#00ccff', 0.95, False, 0.8),  # cyan
+    (SP_TP_R,   'TP Right',          '#ff6600', 0.95, False, 0.8),  # orange
     (SP_SAL,    'Sup Articular L',   '#55aa88', 0.60, True,  1.5),
     (SP_SAR,    'Sup Articular R',   '#338866', 0.60, True,  1.5),
     (SP_CORPUS, 'Corpus Border',     '#5588bb', 0.50, True,  1.5),
@@ -531,7 +541,6 @@ def _generate_clinical_narrative(result: dict, morpho: dict) -> str:
                   f'{rel} L4.')
         paras.append(p)
 
-    # Wrap each paragraph
     html_parts = ['<div class="narr-para">' + p + '</div>' for p in paras]
     return '\n'.join(html_parts)
 
@@ -579,7 +588,6 @@ def build_metrics_panel(result: dict) -> str:
     def crit(txt): return f'<div class="pc">• {txt}</div>'
 
     def prob_bar(label, pct, color, width_cap=100):
-        """Render a labelled probability bar."""
         w = min(pct, width_cap)
         return (
             f'<div class="pb-row">'
@@ -671,8 +679,6 @@ def build_metrics_panel(result: dict) -> str:
         level_proto = surg.get('level_identification_protocol') or []
 
         lines.append(sect('⚕ Surgical Relevance'))
-
-        # Wrong-level risk
         lines.append(
             f'<div class="pr"><span class="pk">Wrong-level risk</span>'
             f'<span class="pv">{risk_chip(wl_risk)}</span></div>'
@@ -684,25 +690,20 @@ def build_metrics_panel(result: dict) -> str:
                          'wn' if nerve_amb else 'ok'))
         lines.append(prob_bar("Bertolotti's syndrome P", bert_pct,
                                '#ff6633' if bert_pct >= 50 else '#ff8800'))
-
         if flags:
             lines.append(f'<div class="ps" style="margin-top:4px">Intraoperative Flags</div>')
             for f in flags:
                 lines.append(f'<div class="surg-flag">⚠ {f}</div>')
-
         if count_rec:
             lines.append(f'<div class="ps" style="margin-top:4px">Counting Protocol</div>')
             lines.append(f'<div class="surg-note">{count_rec}</div>')
-
         if approach:
             lines.append(f'<div class="ps" style="margin-top:4px">Approach Considerations</div>')
             for a in approach:
                 lines.append(f'<div class="surg-note">• {a}</div>')
-
         if ionm_note:
             lines.append(f'<div class="ps" style="margin-top:4px">Neuromonitoring</div>')
             lines.append(f'<div class="surg-note">{ionm_note}</div>')
-
         if level_proto:
             lines.append(f'<div class="ps" style="margin-top:4px">Level ID Protocol</div>')
             for i, step in enumerate(level_proto, 1):
@@ -724,11 +725,10 @@ def build_metrics_panel(result: dict) -> str:
     sc_cls = 'cr' if score >= 8 else 'wn' if score >= 3 else 'ok'
     lines.append(row('Score', f'{score:.0f}', sc_cls))
 
-    # ── Radiologic evidence (v4) ───────────────────────────────────────────────
+    # ── Radiologic evidence ────────────────────────────────────────────────────
     if rad_ev:
         lines.append(sect('Radiologic Evidence'))
         lines.append('<div class="ev-table">')
-        # Group by direction for visual clarity
         for group_dir, group_label in [
             ('sacralization', 'Sacralization criteria'),
             ('lumbarization', 'Lumbarization criteria'),
@@ -748,10 +748,8 @@ def build_metrics_panel(result: dict) -> str:
                 lr_sac   = ev.get('lr_sac', 0) or 0
                 lr_lumb  = ev.get('lr_lumb', 0) or 0
                 lr_str   = ''
-                if lr_sac:
-                    lr_str += f' LR(sac)={lr_sac:+.1f}'
-                if lr_lumb:
-                    lr_str += f' LR(lum)={lr_lumb:+.1f}'
+                if lr_sac:  lr_str += f' LR(sac)={lr_sac:+.1f}'
+                if lr_lumb: lr_str += f' LR(lum)={lr_lumb:+.1f}'
                 lines.append(
                     f'<div class="ev-row">'
                     f'{strength_tag(strength)}'
@@ -831,7 +829,6 @@ def build_metrics_panel(result: dict) -> str:
             lines.append(row(f'{label} ({lvl})', 'ABSENT — possible fusion', 'cr'))
         else:
             lines.append(row(f'{label} ({lvl})', 'Not detected', 'pm'))
-    # Relative disc ratio (v4)
     if rdr is not None:
         rdr_cls = 'cr' if rdr < 0.50 else 'wn' if rdr < 0.65 else 'ok'
         lines.append(row('Relative disc ratio', f'{rdr:.2f}  (Farshad-Amacker 2014)', rdr_cls))
@@ -943,8 +940,6 @@ def build_3d_figure(study_id: str,
     tv_z = _z_range(vert_iso == tv_label) if tv_label else None
 
     # ── Use corrected Z range from 04_detect_lstv if available ────────────────
-    # validate_tp_concordance() runs in 04 and stores the corrected range in
-    # details{}.  Use it here so mesh rendering matches the JSON results.
     details = result.get('details', {})
     tp_corrected = bool(details.get('tp_concordance_corrected', False))
     if tp_corrected and details.get('corrected_tv_z_range'):
@@ -974,7 +969,7 @@ def build_3d_figure(study_id: str,
 
     # ── Trace accumulator with group tags ─────────────────────────────────────
     traces: List  = []
-    groups:  List[str] = []   # 'focused' | 'full'
+    groups:  List[str] = []
 
     def _add(t, group: str = 'focused'):
         if t is not None:
@@ -986,6 +981,8 @@ def build_3d_figure(study_id: str,
             _add(t, group)
 
     # SPINEPS subregion meshes
+    # COLOR FIX: look up colour from SPINE_LABELS table (not hardcoded inline)
+    _spine_col = {lbl: (col, op, fh, mx_s) for lbl, _, col, op, fh, mx_s in SPINE_LABELS}
     for lbl, name, col, op, fh, mx_s in SPINE_LABELS:
         if lbl not in sp_labels: continue
         mask = (tp_L if lbl == SP_TP_L else tp_R if lbl == SP_TP_R else (sp_iso == lbl))
@@ -1027,13 +1024,16 @@ def build_3d_figure(study_id: str,
     if tv_label and tv_label in vert_labels and tv_shape_dict:
         _add_all(tv_body_annotation_traces(vert_iso, tv_label, origin_mm,
                                             tv_shape_dict, phenotype))
-    _add_all(tp_ruler_traces(tp_L, origin_mm, '#ff3333', 'Left',  span_L))
-    _add_all(tp_ruler_traces(tp_R, origin_mm, '#00ccff', 'Right', span_R))
-    _add_all(gap_ruler_traces(tp_L, sac_iso, origin_mm, '#ff8800', 'Left',  dist_L))
-    _add_all(gap_ruler_traces(tp_R, sac_iso, origin_mm, '#00aaff', 'Right', dist_R))
+
+    # TP rulers — use corrected colours matching SPINE_LABELS
+    tp_l_col = _spine_col[SP_TP_L][0] if SP_TP_L in _spine_col else '#00ccff'
+    tp_r_col = _spine_col[SP_TP_R][0] if SP_TP_R in _spine_col else '#ff6600'
+    _add_all(tp_ruler_traces(tp_L, origin_mm, tp_l_col, 'Left',  span_L))
+    _add_all(tp_ruler_traces(tp_R, origin_mm, tp_r_col, 'Right', span_R))
+    _add_all(gap_ruler_traces(tp_L, sac_iso, origin_mm, tp_l_col, 'Left',  dist_L))
+    _add_all(gap_ruler_traces(tp_R, sac_iso, origin_mm, tp_r_col, 'Right', dist_R))
 
     # ── Bounding boxes ─────────────────────────────────────────────────────────
-    # Castellvi-positive TPs
     ct_has = bool(castellvi and castellvi not in ('None', 'N/A'))
     if ct_has:
         ct_col = '#ff2222' if any(x in castellvi for x in ('III','IV')) else '#ff8800'
@@ -1046,7 +1046,6 @@ def build_3d_figure(study_id: str,
                                 f'⚠ Castellvi TP Right ({castellvi})',
                                 dash='dash', width=5))
 
-    # L6 body bounding box (lumbarization)
     lumbar_count = morpho.get('lumbar_count_consensus', 5) or 5
     if lumbar_count == 6 and VD_L6 in vert_labels:
         l6_mask = (vert_iso == VD_L6)
@@ -1055,7 +1054,6 @@ def build_3d_figure(study_id: str,
                                 '⚠ L6 — Extra lumbar segment (LUMBARIZATION)',
                                 dash='dash', width=5, margin_vox=3))
 
-    # Estimated L5 zone for 4-lumbar sacralization
     if lumbar_count == 4:
         l4_mask = None
         if tss_iso is not None and 44 in tss_labels:
@@ -1264,8 +1262,8 @@ button.on-focus{{background:#ff8c00;border-color:#ff8c00;color:#000;font-weight:
   <span class="note">drag=rotate · scroll=zoom · click legend=toggle</span>
 </div>
 <div class="lg">
-  <div class="li"><div class="sw" style="background:#ff3333"></div>TP-Left</div>
-  <div class="li"><div class="sw" style="background:#00ccff"></div>TP-Right</div>
+  <div class="li"><div class="sw" style="background:#00ccff"></div>TP-Left (cyan)</div>
+  <div class="li"><div class="sw" style="background:#ff6600"></div>TP-Right (orange)</div>
   <div class="li"><div class="sw" style="background:#ff8c00"></div>Sacrum</div>
   <div class="li"><div class="sw" style="background:{tv_col};opacity:.95"></div>TV ({tv_name})</div>
   <div class="li"><div class="sw" style="background:#2266aa;opacity:.8"></div>L4/L5</div>
@@ -1316,9 +1314,7 @@ function sv(n){{
   const b=document.getElementById('b-'+n); if(b)b.classList.add('on');
 }}
 
-// Apply focused view on load
 window.addEventListener('load', () => {{ setTimeout(setFocused, 400); }});
-
 window.addEventListener('resize',()=>{{
   const pd=getPlot(); if(pd)Plotly.Plots.resize(pd);
 }});
@@ -1370,7 +1366,6 @@ def save_html(fig, study_id: str, output_dir: Path,
     dhi_disp      = f'{dhi_b:.0f}%' if dhi_b else 'N/A'
     tv_col        = status_cfg['color']
 
-    # v4 probability + surgical risk
     probs  = morpho.get('probabilities') or {}
     surg   = morpho.get('surgical_relevance') or {}
     _n = lambda x: (x * 100 if x <= 1 else x) if x is not None else 0
@@ -1569,7 +1564,6 @@ def main() -> int:
              span_L, span_R, dist_L, dist_R, morpho, cfg,
              focused_vis_json, full_vis_json) = out
 
-            # tp_corrected comes from 04's JSON result, not from figure title
             tp_corrected = bool(result.get('details', {}).get('tp_concordance_corrected', False))
 
             save_html(fig, sid, output_dir,
