@@ -12,7 +12,6 @@ Castellvi classification and phenotype classification are ORTHOGONAL.
 A study may simultaneously have:
   • Castellvi IIb (bilateral pseudo-articulation of L5/L6 TP with sacrum)
   • Phenotype: lumbarization (6-lumbar count, L6 segment identified)
-A sacralizing L5 may have Castellvi I-IV AND sacralization phenotype.
 Neither classification suppresses the other.
 
 LSTV DETECTION FLAGS (lstv_detected = True when ANY of the following):
@@ -26,10 +25,8 @@ Type I   : Dysplastic TP ≥ 19 mm craniocaudal height, no sacral contact
            Ia = unilateral; Ib = bilateral
 Type II  : Pseudo-articulation (diarthrodial joint) between TP and sacrum
            IIa = unilateral; IIb = bilateral
-           MRI: heterogeneous / dark T2 signal at junction (fibrocartilage)
 Type III : Complete osseous fusion of TP with sacrum
            IIIa = unilateral; IIIb = bilateral
-           MRI: homogeneous bright T2 signal (marrow continuity)
 Type IV  : Mixed — one side Type II, other side Type III
 
 LABEL REFERENCE — SOURCE DISAMBIGUATION
@@ -46,42 +43,66 @@ SPINEPS seg-vert_msk.nii.gz  (VERIDAH per-vertebra instance labels):
 TotalSpineSeg sagittal_labeled.nii.gz:
   41=L1  42=L2  43=L3  44=L4  45=L5  50=Sacrum
   91-100 = disc labels
-  Preferred sacrum source (label 50) for Phase 1 distance measurement.
+  Preferred vertebra body source for TV Z-range and segmental axis.
 
-TP POSITIONAL VALIDATION
+TV Z-RANGE DETERMINATION
 --------------------------
-After isolating both TPs at the TV level, each TP centroid is checked
-against two anatomical boundaries:
+The Z range used to isolate SPINEPS TP instances is derived from the
+TotalSpineSeg (TSS) vertebra body label whenever possible, with VERIDAH
+as fallback.  See get_tv_z_range() for full preference order.
 
-  1. TV inferior boundary (tv_z[0] in voxels):
-     A TP centroid should not sit substantially below the TV's own inferior
-     endplate.  If it does, SPINEPS has isolated a fragment from the sacrum
-     or an inferior vertebra rather than the actual TV transverse process.
-     Threshold: TP_BELOW_TV_MM (default 10 mm below TV floor).
+TP HEIGHT MEASUREMENT — PRINCIPAL AXIS METHOD
+---------------------------------------------
+Castellvi's craniocaudal TP height criterion (≥ 19 mm) is measured along
+the anatomic SI axis of the spinal segment, NOT the scanner Z axis.
 
-  2. Sacrum superior boundary (sac_z_sup in voxels):
-     A TP centroid should not be at or below the sacrum's superior surface.
-     If it is, the "TP" is entirely within the sacrum — definitively wrong.
-     Threshold: TP_INTO_SACRUM_MM (default 5 mm — generous for partial-vol).
+The segmental SI axis is defined as the unit vector from the centroid of
+the disc below the transitional vertebra (TV) to the centroid of the disc
+above the TV.  This axis is independent of scanner orientation, corrects
+for spinal curvature, and remains valid for scoliotic and post-surgical
+cases where the anatomic SI axis may deviate substantially from Z.
 
-Either condition on either side triggers re-isolation using TSS L5
-(preferred) or VERIDAH L5 Z-range as the ground truth, because TSS L5 is
-not susceptible to the L6/sacrum confusion that affects SPINEPS.
+The three principal axes of the isolated TP voxel cloud are obtained via
+SVD/PCA on the physical-space (mm) coordinates.  The principal axis with
+the highest absolute cosine similarity to the segmental SI axis is
+selected, and the TP height is the range of voxel projections onto that
+axis.
 
-WHY BILATERAL COMPARISON FAILS
---------------------------------
-Comparing L vs R TP Z-centroids and flagging large discordance (>25 mm) is
-the wrong signal.  In the common failure mode — L6 overlapping the sacrum,
-causing SPINEPS to label the sacral ala as a costal process on one side —
-both TPs land at similar Z positions (L6 and the ala are only ~10–15 mm
-apart).  Bilateral discordance never triggers even when one TP is clearly in
-the sacrum.  Per-TP boundary checks fire as soon as a TP crosses into sacral
-territory regardless of the other side.
+SEGMENTAL AXIS COMPUTATION
+---------------------------
+Preference order for superior / inferior reference points:
 
-This correction is applied before Phase 1 Castellvi measurement and before
-Phase 2 axial analysis, so the JSON results reflect the corrected geometry.
-The visualiser reads 'tp_concordance_corrected' and 'corrected_tv_z_range'
-directly from the result dict.
+  Preferred (disc centroids):
+    sup: TSS disc label above TV (e.g. label 95 = L4-L5 for TV=L5)
+    inf: TSS disc label below TV (e.g. label 100 = L5-S1 for TV=L5)
+
+  Fallback 1 (vertebra body centroids):
+    sup: TSS vertebra body above TV  (e.g. label 44 = L4 for TV=L5)
+    inf: TSS sacrum (label 50) or TSS vert below
+
+  Fallback 2 (VERIDAH vertebra body centroids):
+    Used when TSS label is absent or TV = L6 (no TSS L6 label exists).
+
+  Last resort: scanner Z axis [0, 0, 1].
+
+TSS disc label mapping for each TV:
+  TV=L1 (VD 20):  disc_above=None   disc_below=92 (L1-L2)
+  TV=L2 (VD 21):  disc_above=92     disc_below=93
+  TV=L3 (VD 22):  disc_above=93     disc_below=94
+  TV=L4 (VD 23):  disc_above=94     disc_below=95
+  TV=L5 (VD 24):  disc_above=95     disc_below=100
+  TV=L6 (VD 25):  no TSS disc labels → VERIDAH body fallback
+
+OUTPUT FIELDS (per-side Phase 1 dict)
+--------------------------------------
+  tp_height_mm              : TP extent along chosen axis (Castellvi criterion)
+  tp_axis_chosen            : unit vector of chosen principal axis [x,y,z]
+  tp_axis_cos_segmental     : |cos θ| between chosen axis and segmental SI axis
+  tp_axis_deg_from_segmental: angle in degrees between chosen axis and segmental SI
+  tp_segmental_axis         : segmental SI unit vector [x,y,z] used
+  tp_segmental_axis_source  : description of how the segmental axis was computed
+  tp_z_min_vox / tp_z_max_vox: raw Z indices of TP mask (for visualisation)
+  tp_centroid_z_mm          : Z centroid of TP mask in mm (for visualisation)
 """
 
 from __future__ import annotations
@@ -105,6 +126,7 @@ from lstv_engine import (
     TSS_SACRUM, TSS_LUMBAR, SP_TP_L, SP_TP_R, SP_SACRUM,
     VD_L1, VD_L2, VD_L3, VD_L4, VD_L5, VD_L6, VD_SAC,
     VERIDAH_NAMES, VERIDAH_TV_SEARCH, EXPECTED_LUMBAR,
+    VD_TO_TSS_VERT,
 )
 
 logging.basicConfig(level=logging.INFO,
@@ -113,17 +135,45 @@ logger = logging.getLogger(__name__)
 
 # ── Phase 2 signal thresholds ─────────────────────────────────────────────────
 BBOX_HALF          = 16
-P2_DARK_CLEFT_FRAC = 0.55    # mean < 55% of p95 → dark cleft → Type II
-P2_MIN_STD_RATIO   = 0.12    # CV < 0.12 → uniform bridge → Type III
+P2_DARK_CLEFT_FRAC = 0.55
+P2_MIN_STD_RATIO   = 0.12
 
 # ── Cross-validation thresholds ───────────────────────────────────────────────
 XVAL_MIN_DICE      = 0.30
 XVAL_MAX_CENTROID  = 20.0   # mm
 
-# ── TP sacrum-overlap threshold ───────────────────────────────────────────────
-# Minimum fraction of a TP's voxels that must overlap the TSS sacrum mask
-# before the TP is considered displaced (generous for partial-volume).
-TP_SACRUM_OVERLAP_FRAC = 0.10   # 10 % of TP voxels inside TSS sacrum → displaced
+# ── TSS disc labels adjacent to each possible TV ──────────────────────────────
+# (disc_above_tss_label, disc_below_tss_label)
+# None = that disc level has no TSS label (e.g. T12-L1 rarely segmented; no L6 disc).
+TV_TO_DISC_LABELS: Dict[int, Tuple[Optional[int], Optional[int]]] = {
+    VD_L1: (None,  92),   # inf = L1-L2; no TSS label above L1
+    VD_L2: (92,    93),
+    VD_L3: (93,    94),
+    VD_L4: (94,    95),
+    VD_L5: (95,   100),   # 100 = L5-S1
+    VD_L6: (None, None),  # no TSS disc labels at L6 level
+}
+
+# TSS vertebra body fallback: (vert_above_tss_label, vert_below_tss_label_or_sacrum)
+# Used when the preferred disc label is absent.
+TV_TO_VERT_FALLBACK: Dict[int, Tuple[Optional[int], Optional[int]]] = {
+    VD_L1: (None,       42),
+    VD_L2: (41,         43),
+    VD_L3: (42,         44),
+    VD_L4: (43,         45),
+    VD_L5: (44,         TSS_SACRUM),
+    VD_L6: (45,         TSS_SACRUM),
+}
+
+# VERIDAH vertebra body fallback (used when TSS is absent or TV = L6)
+TV_TO_VD_FALLBACK: Dict[int, Tuple[Optional[int], Optional[int]]] = {
+    VD_L1: (None,    VD_L2),
+    VD_L2: (VD_L1,  VD_L3),
+    VD_L3: (VD_L2,  VD_L4),
+    VD_L4: (VD_L3,  VD_L5),
+    VD_L5: (VD_L4,  VD_SAC),
+    VD_L6: (VD_L5,  VD_SAC),
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -204,9 +254,9 @@ def run_cross_validation(sag_spineps: np.ndarray,
 # MASK OPERATIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_tv_z_range(vert_data: np.ndarray, tv_label: int) -> Optional[Tuple[int, int]]:
-    mask = (vert_data == tv_label)
-    if not mask.any(): return None
+def get_z_range_from_mask(mask: np.ndarray) -> Optional[Tuple[int, int]]:
+    if not mask.any():
+        return None
     zc = np.where(mask)[2]
     return int(zc.min()), int(zc.max())
 
@@ -245,29 +295,6 @@ def inferiormost_tp_cc(tp_mask: np.ndarray,
     return comps[0][2].astype(bool)
 
 
-def measure_tp_height_mm(tp_mask: np.ndarray, vox_mm: np.ndarray) -> float:
-    """
-    Craniocaudal TP height = (Z_max − Z_min + 1) × vox_mm[2].
-    Spans ALL TP voxels — matches Castellvi's original criterion (1984).
-    """
-    if not tp_mask.any(): return 0.0
-    zc = np.where(tp_mask)[2]
-    return float((int(zc.max()) - int(zc.min()) + 1) * vox_mm[2])
-
-
-def tp_centroid_z_mm(sp_data: np.ndarray, tp_label: int,
-                     z_range: Tuple[int, int], vox_mm: np.ndarray,
-                     sac_mask: Optional[np.ndarray] = None) -> Optional[float]:
-    """
-    Return Z centroid (mm) of the inferiormost TP connected component
-    isolated at z_range.  Returns None if the label is absent.
-    """
-    isolated = isolate_tp_at_tv(sp_data, tp_label, *z_range)
-    tp       = inferiormost_tp_cc(isolated, sac_mask)
-    if not tp.any(): return None
-    return float(np.mean(np.where(tp)[2])) * vox_mm[2]
-
-
 def min_dist_3d(mask_a: np.ndarray, mask_b: np.ndarray,
                 vox_mm: np.ndarray) -> Tuple[float, Optional[np.ndarray], Optional[np.ndarray]]:
     if not mask_a.any() or not mask_b.any():
@@ -291,117 +318,353 @@ def min_dist_3d(mask_a: np.ndarray, mask_b: np.ndarray,
     return dist_mm, vox_a, vox_b
 
 
-
 # ══════════════════════════════════════════════════════════════════════════════
-# TP SACRUM-DISPLACEMENT CHECK
+# TV Z-RANGE DETERMINATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def validate_tp_concordance(sag_sp:    np.ndarray,
-                             sag_vert:  np.ndarray,
-                             sag_tss:   Optional[np.ndarray],
-                             vox_mm:    np.ndarray,
-                             tv_z:      Tuple[int, int],
-                             sac_mask:  np.ndarray,
-                             study_id:  str) -> Tuple[bool, Tuple[int, int]]:
+def get_tv_z_range(sag_vert:  np.ndarray,
+                   sag_tss:   Optional[np.ndarray],
+                   tv_label:  int,
+                   study_id:  str) -> Tuple[Optional[Tuple[int, int]], str]:
     """
-    Detect a TP that was isolated from sacral tissue rather than the TV.
+    Determine the Z voxel range of the transitional vertebra body.
 
-    FAILURE MODE
-    ------------
-    SPINEPS mislabels part of the sacrum as L6, so the TP isolated on that
-    side is actually sacral tissue.  The contralateral TP is fine.
-    Bilateral comparison misses this because both sides end up at similar Z.
+    Preference:
+    1. TSS vertebra body label (independent of SPINEPS TP label ambiguity)
+    2. VERIDAH vertebra body label (also the only option for L6)
+    """
+    tss_lbl = VD_TO_TSS_VERT.get(tv_label)
 
-    TWO-TEST APPROACH (both must be true to flag displacement)
-    ----------------------------------------------------------
-    Test 1 — TSS sacrum overlap (TP_SACRUM_OVERLAP_FRAC threshold):
-        >X% of the isolated TP's voxels fall inside TSS sacrum (label 50).
-        Necessary but not sufficient: a real Castellvi Type III TP that is
-        fused to the sacrum will also overlap — hence Test 2.
+    if tss_lbl is not None and sag_tss is not None:
+        tss_mask = (sag_tss == tss_lbl)
+        if tss_mask.any():
+            zr  = get_z_range_from_mask(tss_mask)
+            src = f'TSS label {tss_lbl} ({VERIDAH_NAMES.get(tv_label, str(tv_label))})'
+            logger.info(f"  [{study_id}] TV Z range from {src}: {zr}")
+            return zr, src
+        logger.warning(
+            f"  [{study_id}] TSS label {tss_lbl} yields empty mask — "
+            f"falling back to VERIDAH")
 
-    Test 2 — TP centroid is below the L5/S1 disc superior edge:
-        TSS labels the L5-S1 disc as label 100.  A real lumbar TP — even a
-        fused Type III — originates from the TV body and its centroid stays
-        above the disc space.  A mislabeled sacral "TP" will have its
-        centroid below the disc.  Fallback: TSS sacrum superior edge.
+    vd_mask = (sag_vert == tv_label)
+    if vd_mask.any():
+        zr  = get_z_range_from_mask(vd_mask)
+        src = (f'VERIDAH label {tv_label} '
+               f'({VERIDAH_NAMES.get(tv_label, str(tv_label))}) [fallback]')
+        logger.info(f"  [{study_id}] TV Z range from {src}: {zr}")
+        return zr, src
 
-    If either side fails both tests → re-isolate both TPs from TSS L5 Z-range
-    (VERIDAH L5 if TSS L5 absent).
+    logger.warning(f"  [{study_id}] TV label {tv_label} not found in TSS or VERIDAH")
+    return None, 'not found'
 
-    Returns (corrected: bool, z_range_to_use: Tuple[int, int])
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SEGMENTAL SI AXIS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _mask_centroid_mm(mask: np.ndarray, vox_mm: np.ndarray) -> Optional[np.ndarray]:
+    """Physical-space centroid of a boolean mask in mm."""
+    if not mask.any():
+        return None
+    idx = np.array(np.where(mask), dtype=np.float64)   # (3, N)
+    return idx.mean(axis=1) * vox_mm                    # (3,)
+
+
+def compute_segmental_axis(
+        sag_tss:  Optional[np.ndarray],
+        sag_vert: np.ndarray,
+        tv_label: int,
+        vox_mm:   np.ndarray,
+        study_id: str,
+) -> Tuple[np.ndarray, str]:
+    """
+    Compute the anatomic superior–inferior (SI) unit axis of the spinal
+    segment at the transitional vertebra (TV).
+
+    The axis is the unit vector pointing from the centroid of the structure
+    immediately INFERIOR to the TV (disc below, or sacrum) to the centroid
+    of the structure immediately SUPERIOR to the TV (disc above, or vertebra
+    body above).  This is the anatomic craniocaudal axis of the segment,
+    independent of scanner orientation.
+
+    Reference structures are obtained in preference order:
+      1. TSS disc centroids  (most stable — disc centroids hug the endplates)
+      2. TSS vertebra body centroids
+      3. VERIDAH vertebra body centroids  (for L6 or when TSS is absent)
+      4. Scanner Z axis [0, 0, 1]  (last resort; triggers a warning)
+
+    Parameters
+    ----------
+    sag_tss   : TotalSpineSeg sagittal volume (may be None)
+    sag_vert  : SPINEPS seg-vert_msk (VERIDAH) volume
+    tv_label  : VERIDAH label of the transitional vertebra (20–25)
+    vox_mm    : physical voxel size [x, y, z] in mm
+    study_id  : for log messages
+
+    Returns
+    -------
+    (axis_unit_vector, source_description)
+      axis_unit_vector : np.ndarray shape (3,), cranially pointing
+      source_description : human-readable string naming the reference landmarks
+    """
+    disc_above_lbl, disc_below_lbl = TV_TO_DISC_LABELS.get(tv_label, (None, None))
+    vert_above_tss, vert_below_tss = TV_TO_VERT_FALLBACK.get(tv_label, (None, None))
+    vd_above,       vd_below       = TV_TO_VD_FALLBACK.get(tv_label, (None, None))
+
+    sup_pt:  Optional[np.ndarray] = None
+    inf_pt:  Optional[np.ndarray] = None
+    sup_src: str = ''
+    inf_src: str = ''
+
+    # ── Superior reference (disc above → TSS vert above → VERIDAH vert above) ─
+    if disc_above_lbl is not None and sag_tss is not None:
+        m = (sag_tss == disc_above_lbl)
+        if m.any():
+            sup_pt  = _mask_centroid_mm(m, vox_mm)
+            sup_src = f'TSS disc {disc_above_lbl}'
+
+    if sup_pt is None and vert_above_tss is not None and sag_tss is not None:
+        m = (sag_tss == vert_above_tss)
+        if m.any():
+            sup_pt  = _mask_centroid_mm(m, vox_mm)
+            sup_src = f'TSS vert {vert_above_tss}'
+
+    if sup_pt is None and vd_above is not None:
+        m = (sag_vert == vd_above)
+        if m.any():
+            sup_pt  = _mask_centroid_mm(m, vox_mm)
+            sup_src = f'VERIDAH vert {vd_above}'
+
+    # ── Inferior reference (disc below → TSS sacrum/vert → VERIDAH sacrum/vert) ─
+    if disc_below_lbl is not None and sag_tss is not None:
+        m = (sag_tss == disc_below_lbl)
+        if m.any():
+            inf_pt  = _mask_centroid_mm(m, vox_mm)
+            inf_src = f'TSS disc {disc_below_lbl}'
+
+    if inf_pt is None and vert_below_tss is not None and sag_tss is not None:
+        m = (sag_tss == vert_below_tss)
+        if m.any():
+            inf_pt  = _mask_centroid_mm(m, vox_mm)
+            inf_src = (f'TSS sacrum'
+                       if vert_below_tss == TSS_SACRUM
+                       else f'TSS vert {vert_below_tss}')
+
+    if inf_pt is None and vd_below is not None:
+        m = (sag_vert == vd_below)
+        if m.any():
+            inf_pt  = _mask_centroid_mm(m, vox_mm)
+            inf_src = (f'VERIDAH sacrum'
+                       if vd_below == VD_SAC
+                       else f'VERIDAH vert {vd_below}')
+
+    # ── Last resort: scanner Z axis ────────────────────────────────────────────
+    if sup_pt is None or inf_pt is None:
+        missing = ([' superior'] if sup_pt is None else []) + \
+                  ([' inferior'] if inf_pt is None else [])
+        logger.warning(
+            f"  [{study_id}] Segmental axis: could not locate"
+            f"{''.join(missing)} reference — falling back to scanner Z axis"
+        )
+        return np.array([0.0, 0.0, 1.0]), 'scanner Z axis (fallback)'
+
+    # ── Build unit vector: inf → sup (caudal to cranial) ─────────────────────
+    raw  = sup_pt - inf_pt
+    norm = float(np.linalg.norm(raw))
+    if norm < 1e-6:
+        logger.warning(
+            f"  [{study_id}] Segmental axis: {sup_src} and {inf_src} have "
+            f"identical centroids — falling back to scanner Z axis"
+        )
+        return np.array([0.0, 0.0, 1.0]), 'scanner Z axis (degenerate centroids)'
+
+    unit = raw / norm
+    src  = f'{inf_src} → {sup_src}'
+    logger.info(
+        f"  [{study_id}] Segmental SI axis: {src}  "
+        f"v=[{unit[0]:.3f},{unit[1]:.3f},{unit[2]:.3f}]  "
+        f"Z-component={unit[2]:.3f}"
+    )
+    return unit, src
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TP HEIGHT — PRINCIPAL AXIS METHOD
+# ══════════════════════════════════════════════════════════════════════════════
+
+def measure_tp_height_principal_axis(
+        tp_mask:        np.ndarray,
+        vox_mm:         np.ndarray,
+        segmental_axis: np.ndarray,
+) -> Tuple[float, np.ndarray, float, np.ndarray]:
+    """
+    Measure the craniocaudal extent of a transverse process along the
+    principal axis that best aligns with the segmental SI axis.
+
+    RATIONALE
+    ---------
+    Castellvi (1984) specifies "craniocaudal height" of the TP.  In a spine
+    with normal alignment this equals the Z-extent, but in scoliosis, kyphosis,
+    or any oblique acquisition the Z axis may deviate substantially from the
+    anatomic SI axis of the segment.  Measuring along the dominant structural
+    axis of the TP itself — the one that matches the segmental SI direction —
+    is anatomically and geometrically correct.
+
+    ALGORITHM
+    ---------
+    1. Convert TP mask voxel indices to physical mm coordinates.
+    2. Mean-centre the point cloud.
+    3. Decompose via SVD → three right singular vectors = principal axes
+       sorted by descending explained variance (first = longest axis).
+    4. Select the principal axis whose |dot product| with segmental_axis is
+       maximised.  This is the axis that best represents the craniocaudal
+       direction within the TP geometry.
+    5. Orient the selected axis cranially (positive dot with segmental_axis).
+    6. Project ALL TP voxels onto the selected axis.
+    7. Height = max(projection) − min(projection).
+
+    Parameters
+    ----------
+    tp_mask        : 3-D boolean array of isolated TP voxels
+    vox_mm         : physical voxel size [x, y, z] mm
+    segmental_axis : unit vector (cranially pointing) of the segmental SI axis
+
+    Returns
+    -------
+    height_mm      : craniocaudal extent in mm along the chosen axis
+    chosen_axis    : the principal axis vector used (unit, cranially oriented)
+    cos_align      : |cos θ| between chosen_axis and segmental_axis
+    principal_axes : (3, 3) array — all three principal axes as rows, by
+                     descending explained variance
+    """
+    if not tp_mask.any():
+        return 0.0, segmental_axis.copy(), 0.0, np.eye(3)
+
+    # Physical coordinates of every TP voxel (N × 3, in mm)
+    idx    = np.array(np.where(tp_mask), dtype=np.float64).T   # (N, 3)
+    pts_mm = idx * vox_mm                                       # (N, 3)
+    n_pts  = pts_mm.shape[0]
+
+    # Degenerate case: too few points for PCA
+    if n_pts < 3:
+        proj = pts_mm @ segmental_axis
+        height = float(proj.max() - proj.min()) if n_pts > 1 else 0.0
+        return height, segmental_axis.copy(), 1.0, np.eye(3)
+
+    centred = pts_mm - pts_mm.mean(axis=0)
+
+    # Thin SVD — Vt rows are right singular vectors (principal axes),
+    # ordered by descending singular value (= descending variance).
+    try:
+        _, _, Vt = np.linalg.svd(centred, full_matrices=False)
+    except np.linalg.LinAlgError:
+        logger.warning("SVD failed — using segmental axis directly for TP height")
+        proj = pts_mm @ segmental_axis
+        return float(proj.max() - proj.min()), segmental_axis.copy(), 1.0, np.eye(3)
+
+    principal_axes = Vt   # shape (3, 3); row i = i-th principal axis
+
+    # ── Select the axis most aligned with the segmental SI direction ──────────
+    dots    = np.abs(principal_axes @ segmental_axis)   # (3,)
+    best    = int(np.argmax(dots))
+    chosen  = principal_axes[best].copy()
+
+    # Ensure consistent cranial orientation
+    if np.dot(chosen, segmental_axis) < 0:
+        chosen = -chosen
+
+    cos_align = float(dots[best])
+    deg       = float(np.degrees(np.arccos(np.clip(cos_align, 0.0, 1.0))))
+
+    # ── Measure extent along chosen axis ─────────────────────────────────────
+    proj      = pts_mm @ chosen
+    height_mm = float(proj.max() - proj.min())
+
+    logger.debug(
+        f"    TP PCA: N={n_pts}  "
+        f"axis=[{chosen[0]:.3f},{chosen[1]:.3f},{chosen[2]:.3f}]  "
+        f"|cosθ|={cos_align:.3f} ({deg:.1f}°)  h={height_mm:.1f}mm"
+    )
+
+    return height_mm, chosen, cos_align, principal_axes
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# L6 VERIFICATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+TSS_DISC_LABELS = set(range(91, 101))
+
+
+def _verify_l6(sag_vert:  np.ndarray,
+               sag_tss:   Optional[np.ndarray],
+               vox_mm:    np.ndarray,
+               tv_z:      Tuple[int, int],
+               study_id:  str) -> Tuple[bool, str]:
+    """
+    Confirm that VERIDAH's L6 label is a genuine extra lumbar vertebra.
+
+    Three checks (all must pass):
+      1. Positional sanity: L6 centroid between TSS L5 inferior and TSS
+         sacrum superior.
+      2. Disc ABOVE L6: TSS disc centroid clearly above L6 superior edge
+         (L5-L6 disc space present).
+      3. Disc BELOW L6: TSS disc centroid between L6 inferior edge and
+         sacrum superior edge (L6-S1 disc space present).
     """
     if sag_tss is None:
-        return False, tv_z
+        return False, "no TSS available — cannot verify L6"
 
-    tss_sacrum_mask = (sag_tss == TSS_SACRUM)
-    if not tss_sacrum_mask.any():
-        return False, tv_z
+    l6_z_min, l6_z_max = tv_z
+    l6_centroid_z = (l6_z_min + l6_z_max) / 2.0
 
-    # Disc floor = superior edge of TSS L5-S1 disc (label 100).
-    # Fallback to sacrum superior edge if disc label absent.
-    tss_disc = (sag_tss == 100)
-    if tss_disc.any():
-        disc_floor_z = int(np.where(tss_disc)[2].max())
-        disc_floor_src = 'TSS L5-S1 disc (label 100)'
-    elif tss_sacrum_mask.any():
-        disc_floor_z = int(np.where(tss_sacrum_mask)[2].max())
-        disc_floor_src = 'TSS sacrum superior edge (fallback)'
-    else:
-        return False, tv_z
+    tss_l5   = (sag_tss == 45)
+    tss_sac  = (sag_tss == TSS_SACRUM)
 
-    def _is_displaced(tp_lbl: int, side: str) -> bool:
-        isolated = isolate_tp_at_tv(sag_sp, tp_lbl, *tv_z)
-        tp = inferiormost_tp_cc(isolated, tss_sacrum_mask)
-        if not tp.any():
-            return False
+    if not tss_sac.any():
+        return False, "TSS sacrum (label 50) absent — cannot verify L6 position"
 
-        n_tp          = int(tp.sum())
-        overlap_frac  = int((tp & tss_sacrum_mask).sum()) / n_tp
-        centroid_z    = float(np.mean(np.where(tp)[2]))   # voxels
-        below_disc    = centroid_z < disc_floor_z
+    sac_z_sup = float(np.where(tss_sac)[2].max())
 
-        logger.info(
-            f"  [{study_id}] {side:5s} TP  sacrum_overlap={overlap_frac:.1%}  "
-            f"centroid_z={centroid_z:.1f}vox  disc_floor_z={disc_floor_z}vox "
-            f"({disc_floor_src})  below_disc={below_disc}"
-        )
+    if l6_centroid_z <= sac_z_sup:
+        return False, (
+            f"L6 centroid z={l6_centroid_z:.0f} ≤ TSS sacrum superior z={sac_z_sup:.0f} "
+            f"— VERIDAH L6 inside sacrum (mislabeled sacrum)")
 
-        if overlap_frac >= TP_SACRUM_OVERLAP_FRAC and below_disc:
-            logger.warning(
-                f"  [{study_id}] {side} TP DISPLACED IN SACRUM — "
-                f"{overlap_frac:.0%} overlap with TSS sacrum "
-                f"AND centroid ({centroid_z:.0f}) below disc floor ({disc_floor_z})"
-            )
-            return True
-        return False
-
-    displaced_L = _is_displaced(SP_TP_L, 'left')
-    displaced_R = _is_displaced(SP_TP_R, 'right')
-
-    if not displaced_L and not displaced_R:
-        return False, tv_z
-
-    # Re-isolate from TSS L5 Z-range
-    ref_z: Optional[Tuple[int, int]] = None
-    tss_l5 = (sag_tss == 45)
     if tss_l5.any():
-        zc = np.where(tss_l5)[2]
-        ref_z = (int(zc.min()), int(zc.max()))
-        logger.info(f"  [{study_id}] Using TSS L5 Z reference: {ref_z}")
-    if ref_z is None:
-        vd_l5 = (sag_vert == VD_L5)
-        if vd_l5.any():
-            zc = np.where(vd_l5)[2]
-            ref_z = (int(zc.min()), int(zc.max()))
-            logger.info(f"  [{study_id}] Using VERIDAH L5 Z reference: {ref_z}")
-    if ref_z is None:
-        logger.warning(f"  [{study_id}] Cannot correct — no L5 reference available")
-        return False, tv_z
+        l5_z_min = float(np.where(tss_l5)[2].min())
+        if l6_centroid_z >= l5_z_min:
+            return False, (
+                f"L6 centroid z={l6_centroid_z:.0f} ≥ TSS L5 inferior z={l5_z_min:.0f} "
+                f"— VERIDAH L6 overlaps TSS L5")
 
-    sides = ('left ' if displaced_L else '') + ('right' if displaced_R else '')
-    logger.info(f"  [{study_id}] TP correction: {sides.strip()} displaced → re-isolating both from {ref_z}")
-    return True, ref_z
+    disc_above_z: Optional[float] = None
+    disc_below_z: Optional[float] = None
 
+    for disc_lbl in TSS_DISC_LABELS:
+        disc_mask = (sag_tss == disc_lbl)
+        if not disc_mask.any():
+            continue
+        disc_zc = float(np.mean(np.where(disc_mask)[2]))
+        if disc_zc > l6_z_max + 2:
+            if disc_above_z is None or disc_zc < disc_above_z:
+                disc_above_z = disc_zc
+        if disc_zc < l6_z_min - 2 and disc_zc > sac_z_sup:
+            if disc_below_z is None or disc_zc > disc_below_z:
+                disc_below_z = disc_zc
+
+    if disc_above_z is None:
+        return False, (
+            f"no TSS disc above VERIDAH L6 (z=[{l6_z_min},{l6_z_max}]) — "
+            f"no L5-L6 disc space")
+    if disc_below_z is None:
+        return False, (
+            f"no TSS disc between L6 inferior (z={l6_z_min}) and "
+            f"sacrum superior (z={sac_z_sup:.0f}) — no L6-S1 disc space")
+
+    return True, (
+        f"positional OK (centroid z={l6_centroid_z:.0f}, sac_sup={sac_z_sup:.0f}), "
+        f"disc above z={disc_above_z:.0f}, disc below z={disc_below_z:.0f}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -420,11 +683,10 @@ def _extract_bbox(axial_t2w: np.ndarray, midpoint: np.ndarray,
 
 def _classify_signal(patch: np.ndarray, axial_t2w: np.ndarray) -> Tuple[str, dict]:
     """
-    Classify axial T2w signal at the TP–sacrum junction.
-
-    MRI classification (Konin & Walz 2010; Nidecker et al. 2018):
-      Dark / intermediate signal → fibrocartilaginous pseudo-joint → Type II
-      Bright homogeneous signal  → osseous marrow bridge           → Type III
+    Classify axial T2w signal at TP–sacrum junction.
+    Dark/intermediate → fibrocartilaginous pseudo-joint → Type II
+    Bright homogeneous → osseous marrow bridge           → Type III
+    (Konin & Walz 2010; Nidecker et al. 2018)
     """
     vals = patch.astype(float).ravel()
     vals = vals[np.isfinite(vals)]
@@ -443,28 +705,22 @@ def _classify_signal(patch: np.ndarray, axial_t2w: np.ndarray) -> Tuple[str, dic
         'coeff_var':  round(cv, 4),     'global_p95': round(p95, 2),
         'dark_thresh':round(dark_thr, 2), 'valid': True,
     }
-
     if p_mean < dark_thr:
         feats['reason'] = (f"mean={p_mean:.1f} < dark_thr={dark_thr:.1f} "
-                           f"— dark/intermediate signal → fibrocartilage cleft → Type II")
+                           f"— dark/intermediate → fibrocartilage → Type II")
         return 'Type II', feats
     elif cv < P2_MIN_STD_RATIO:
         feats['reason'] = (f"CV={cv:.3f} < {P2_MIN_STD_RATIO} "
-                           f"— uniform bright signal → osseous marrow bridge → Type III")
+                           f"— uniform bright → marrow bridge → Type III")
         return 'Type III', feats
     else:
-        feats['reason'] = "Bright but heterogeneous — ambiguous; Type II (conservative)"
+        feats['reason'] = "Bright heterogeneous — ambiguous; Type II (conservative)"
         return 'Type II', feats
 
 
 def phase2_axial(side: str, tp_label: int,
                  ax_spineps: np.ndarray, ax_tss: np.ndarray,
                  ax_t2w: np.ndarray, ax_vox_mm: np.ndarray) -> dict:
-    """
-    Phase 2 using axial T2w signal at the TP–sacrum junction.
-    ax_spineps : registered SPINEPS seg-spine labels (43=TP-left, 44=TP-right)
-    ax_tss     : native TSS axial labels (50=sacrum; 43/44 = L3/L4, NOT TPs)
-    """
     out: dict = {'phase2_attempted': True, 'classification': 'Type II',
                  'midpoint_vox': None, 'p2_features': None, 'p2_valid': False}
 
@@ -483,7 +739,7 @@ def phase2_axial(side: str, tp_label: int,
         out['p2_note'] = 'min_dist_3d returned None'
         return out
 
-    midpoint = ((vox_a + vox_b) / 2.0).astype(int)
+    midpoint             = ((vox_a + vox_b) / 2.0).astype(int)
     out['midpoint_vox']  = midpoint.tolist()
     out['axial_dist_mm'] = round(float(dist_mm), 3)
 
@@ -492,10 +748,10 @@ def phase2_axial(side: str, tp_label: int,
         out['p2_note'] = 'Bounding box outside axial volume'
         return out
 
-    cls, feats              = _classify_signal(patch, ax_t2w)
-    out['classification']   = cls
-    out['p2_features']      = feats
-    out['p2_valid']         = feats.get('valid', False)
+    cls, feats           = _classify_signal(patch, ax_t2w)
+    out['classification'] = cls
+    out['p2_features']    = feats
+    out['p2_valid']       = feats.get('valid', False)
     return out
 
 
@@ -503,32 +759,53 @@ def phase2_axial(side: str, tp_label: int,
 # PHASE 1 — SAGITTAL GEOMETRIC CLASSIFIER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def phase1_sagittal(side: str, tp_label: int,
-                    sag_sp: np.ndarray, sag_tss: Optional[np.ndarray],
-                    sag_vox_mm: np.ndarray,
-                    tv_z_range: Tuple[int, int]) -> dict:
+def phase1_sagittal(side:           str,
+                    tp_label:       int,
+                    sag_sp:         np.ndarray,
+                    sag_tss:        Optional[np.ndarray],
+                    sag_vox_mm:     np.ndarray,
+                    tv_z_range:     Tuple[int, int],
+                    segmental_axis: np.ndarray,
+                    segmental_src:  str) -> dict:
     """
     Phase 1: sagittal geometric Castellvi analysis.
-    TP height threshold: ≥ 19 mm (Castellvi et al. 1984).
-    Contact threshold: ≤ 2 mm 3D distance to sacrum.
 
-    tv_z_range may be the original VERIDAH TV Z range or the concordance-
-    corrected TSS/VERIDAH L5 Z range — caller decides which to use.
+    TP craniocaudal height is measured along the principal axis of the TP
+    voxel cloud that best aligns with the segmental SI axis (see
+    measure_tp_height_principal_axis).  This replaces the naive Z-extent
+    measurement and correctly handles oblique TP orientations.
+
+    Contact threshold : ≤ 2 mm 3D Euclidean distance to sacrum.
+    Type I threshold  : TP height ≥ 19 mm (Castellvi 1984) without contact.
+
+    Parameters
+    ----------
+    segmental_axis : cranially-pointing SI unit vector for this TV level,
+                     computed by compute_segmental_axis()
+    segmental_src  : human-readable description of how the axis was derived
     """
     out = {
         'tp_present': False, 'tp_height_mm': 0.0, 'contact': False,
         'dist_mm': float('inf'), 'tp_vox': None, 'sacrum_vox': None,
         'classification': 'Normal', 'phase1_done': False, 'sacrum_source': None,
+        # ── Principal axis fields ─────────────────────────────────────────────
+        'tp_axis_chosen':             None,
+        'tp_axis_cos_segmental':      None,
+        'tp_axis_deg_from_segmental': None,
+        'tp_segmental_axis':          segmental_axis.tolist(),
+        'tp_segmental_axis_source':   segmental_src,
     }
 
+    # ── Sacrum mask ───────────────────────────────────────────────────────────
     tss_sac = (sag_tss == TSS_SACRUM) if sag_tss is not None else None
     if tss_sac is not None and tss_sac.any():
         sac_mask             = tss_sac
         out['sacrum_source'] = f'TSS label {TSS_SACRUM}'
     else:
-        sac_mask = (sag_sp == SP_SACRUM)
+        sac_mask             = (sag_sp == SP_SACRUM)
         out['sacrum_source'] = 'SPINEPS label 26 (fallback)'
 
+    # ── Isolate TP at TV level ────────────────────────────────────────────────
     tp_at_tv = isolate_tp_at_tv(sag_sp, tp_label, *tv_z_range)
     tp_mask  = inferiormost_tp_cc(tp_at_tv, sac_mask if sac_mask.any() else None)
 
@@ -536,141 +813,44 @@ def phase1_sagittal(side: str, tp_label: int,
         out['note'] = f"TP label {tp_label} absent at TV level"
         return out
 
-    out['tp_present']   = True
-    out['tp_height_mm'] = measure_tp_height_mm(tp_mask, sag_vox_mm)
-    out['tp_z_min_vox'] = int(np.where(tp_mask)[2].min())
-    out['tp_z_max_vox'] = int(np.where(tp_mask)[2].max())
-    out['tp_centroid_z_mm'] = round(
-        float(np.mean(np.where(tp_mask)[2])) * sag_vox_mm[2], 2)
+    out['tp_present'] = True
+
+    # Z indices retained for visualisation
+    tp_z_coords         = np.where(tp_mask)[2]
+    out['tp_z_min_vox'] = int(tp_z_coords.min())
+    out['tp_z_max_vox'] = int(tp_z_coords.max())
+    out['tp_centroid_z_mm'] = round(float(tp_z_coords.mean()) * sag_vox_mm[2], 2)
+
+    # ── TP height via principal axis aligned to segmental SI axis ─────────────
+    h_mm, chosen_axis, cos_align, _principal_axes = measure_tp_height_principal_axis(
+        tp_mask, sag_vox_mm, segmental_axis)
+
+    out['tp_height_mm']               = round(h_mm, 3)
+    out['tp_axis_chosen']             = [round(float(v), 5) for v in chosen_axis]
+    out['tp_axis_cos_segmental']      = round(cos_align, 4)
+    out['tp_axis_deg_from_segmental'] = round(
+        float(np.degrees(np.arccos(np.clip(cos_align, 0.0, 1.0)))), 2)
 
     if not sac_mask.any():
         return out
 
+    # ── Distance to sacrum ────────────────────────────────────────────────────
     dist_mm, tp_vox, sac_vox = min_dist_3d(tp_mask, sac_mask, sag_vox_mm)
-    out['dist_mm']    = round(float(dist_mm), 3)
-    out['phase1_done']= True
+    out['dist_mm']     = round(float(dist_mm), 3)
+    out['phase1_done'] = True
     if tp_vox  is not None: out['tp_vox']     = tp_vox.tolist()
     if sac_vox is not None: out['sacrum_vox'] = sac_vox.tolist()
 
+    # ── Castellvi classification ──────────────────────────────────────────────
     if dist_mm > CONTACT_DIST_MM:
-        out['contact']        = False
-        if out['tp_height_mm'] >= TP_HEIGHT_MM:
+        out['contact'] = False
+        if h_mm >= TP_HEIGHT_MM:
             out['classification'] = 'Type I'
     else:
         out['contact']        = True
         out['classification'] = 'CONTACT_PENDING_P2'
 
     return out
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# L6 VERIFICATION
-# ══════════════════════════════════════════════════════════════════════════════
-
-# TSS disc label range (sagittal_labeled.nii.gz).  Labels 91–100 are IVDs
-# counted cranio-caudally; 100 is the most caudal (L5-S1 in a 5-lumbar spine,
-# L6-S1 in lumbarization).  We don't hardcode which number is which disc —
-# instead we look for disc labels that are spatially above or below the
-# candidate L6 body.
-TSS_DISC_LABELS = set(range(91, 101))
-
-
-def _verify_l6(sag_vert:  np.ndarray,
-               sag_tss:   Optional[np.ndarray],
-               vox_mm:    np.ndarray,
-               tv_z:      Tuple[int, int],
-               study_id:  str) -> Tuple[bool, str]:
-    """
-    Confirm that VERIDAH's L6 label is a genuine extra lumbar vertebra.
-
-    Three checks (all must pass):
-
-    Check 1 — Positional sanity:
-        VERIDAH L6 centroid Z must lie BELOW TSS L5 inferior edge AND
-        ABOVE TSS sacrum superior edge.  A sacrum mislabeled as L6 will
-        have its centroid inside or overlapping the TSS sacrum.
-
-    Check 2 — Disc ABOVE L6 (L5-L6 disc space):
-        At least one TSS disc label (91-100) must have its centroid Z
-        clearly above the VERIDAH L6 superior edge.  Confirms a real disc
-        exists between L5 and L6.
-
-    Check 3 — Disc BELOW L6 (L6-S1 disc space):
-        At least one TSS disc label must have its centroid Z clearly below
-        the VERIDAH L6 inferior edge AND above the TSS sacrum superior edge.
-        Confirms the lumbosacral disc is at L6-S1, not L5-S1.
-
-    Returns (verified: bool, reason: str)
-    """
-    if sag_tss is None:
-        return False, "no TSS available — cannot verify L6"
-
-    l6_z_min, l6_z_max = tv_z
-    l6_centroid_z = (l6_z_min + l6_z_max) / 2.0
-
-    # ── Check 1: positional sanity ─────────────────────────────────────────────
-    tss_l5   = (sag_tss == 45)
-    tss_sac  = (sag_tss == TSS_SACRUM)
-
-    if not tss_sac.any():
-        return False, "TSS sacrum (label 50) absent — cannot verify L6 position"
-
-    sac_z_sup = float(np.where(tss_sac)[2].max())   # superior edge of sacrum
-
-    # L6 centroid must be above the sacrum
-    if l6_centroid_z <= sac_z_sup:
-        return False, (
-            f"L6 centroid z={l6_centroid_z:.0f} ≤ TSS sacrum superior z={sac_z_sup:.0f} "
-            f"— VERIDAH L6 is inside the sacrum (mislabeled sacrum)"
-        )
-
-    # L6 must be inferior to TSS L5
-    if tss_l5.any():
-        l5_z_min = float(np.where(tss_l5)[2].min())
-        if l6_centroid_z >= l5_z_min:
-            return False, (
-                f"L6 centroid z={l6_centroid_z:.0f} ≥ TSS L5 inferior z={l5_z_min:.0f} "
-                f"— VERIDAH L6 overlaps TSS L5 (not a distinct inferior segment)"
-            )
-
-    # ── Check 2 & 3: discs above and below L6 ─────────────────────────────────
-    disc_above_z: Optional[float] = None   # centroid Z of a disc above L6
-    disc_below_z: Optional[float] = None   # centroid Z of a disc below L6
-
-    for disc_lbl in TSS_DISC_LABELS:
-        disc_mask = (sag_tss == disc_lbl)
-        if not disc_mask.any():
-            continue
-        disc_zc = float(np.mean(np.where(disc_mask)[2]))
-
-        # Disc clearly above L6 superior edge (allow 2-vox slop for partial vol)
-        if disc_zc > l6_z_max + 2:
-            if disc_above_z is None or disc_zc < disc_above_z:
-                disc_above_z = disc_zc   # take the closest disc above
-
-        # Disc clearly below L6 inferior edge, but still above sacrum
-        if disc_zc < l6_z_min - 2 and disc_zc > sac_z_sup:
-            if disc_below_z is None or disc_zc > disc_below_z:
-                disc_below_z = disc_zc   # take the closest disc below
-
-    if disc_above_z is None:
-        return False, (
-            f"no TSS disc found above VERIDAH L6 (L6 z=[{l6_z_min},{l6_z_max}]) — "
-            f"no L5-L6 disc space present"
-        )
-
-    if disc_below_z is None:
-        return False, (
-            f"no TSS disc found between VERIDAH L6 inferior (z={l6_z_min}) and "
-            f"TSS sacrum superior (z={sac_z_sup:.0f}) — no L6-S1 disc space present"
-        )
-
-    return True, (
-        f"positional OK (centroid z={l6_centroid_z:.0f}, "
-        f"sac_sup={sac_z_sup:.0f}), "
-        f"disc above z={disc_above_z:.0f}, "
-        f"disc below z={disc_below_z:.0f}"
-    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -762,9 +942,9 @@ def classify_study(study_id:       str,
     for w in xval.get('warnings', []): out['errors'].append(f'XVAL: {w}')
 
     # ── Axial data (Phase 2) ───────────────────────────────────────────────────
-    ax_tss, ax_tss_nii = _load(tss_ax, 'TSS axial')
-    ax_sp,  _          = _load(sp_ax,  'registered SPINEPS axial')
-    ax_t2w, ax_vox_mm  = None, None
+    ax_tss, _ = _load(tss_ax, 'TSS axial')
+    ax_sp,  _ = _load(sp_ax,  'registered SPINEPS axial')
+    ax_t2w, ax_vox_mm = None, None
     t2w_path = _find_t2w('ax')
     if t2w_path:
         arr, t2w_nii = _load(t2w_path, 'axial T2w')
@@ -792,88 +972,84 @@ def classify_study(study_id:       str,
     if tv_label is None:
         out['errors'].append('No lumbar VERIDAH labels found'); return out
 
-    tv_z = get_tv_z_range(sag_vert, tv_label)
-    if tv_z is None:
-        out['errors'].append(f'TV label {tv_name} empty in VERIDAH mask'); return out
-
-    # ── L6 verification (lumbarization cases) ─────────────────────────────────
-    # SPINEPS sometimes mislabels the sacrum as L6. VERIDAH then finds "L6"
-    # whose Z range is in the sacrum. Isolating TPs at that Z range finds no
-    # real costal process voxels and falls through to L4's TPs, producing a
-    # spurious L4-TP→sacrum Castellvi measurement.
-    #
-    # Verification requires ALL THREE of the following to pass:
-    #   1. VERIDAH L6 centroid sits between TSS sacrum superior and TSS L5 inferior
-    #      (positional sanity — a sacrum mislabeled as L6 fails immediately)
-    #   2. A TSS disc exists ABOVE VERIDAH L6 (L5-L6 disc space)
-    #   3. A TSS disc exists BELOW VERIDAH L6 (L6-S1 disc space)
-    # If any check fails, demote to VERIDAH L5 as the TV.
+    # ── L6 verification ────────────────────────────────────────────────────────
     l6_verified = False
     if tv_label == VD_L6:
-        l6_ok, l6_reason = _verify_l6(sag_vert, sag_tss, vox_mm, tv_z, study_id)
+        vd_l6_z = get_z_range_from_mask(sag_vert == VD_L6)
+        if vd_l6_z is None:
+            out['errors'].append('VERIDAH L6 label present but empty mask')
+            return out
+        l6_ok, l6_reason = _verify_l6(sag_vert, sag_tss, vox_mm, vd_l6_z, study_id)
         l6_verified = l6_ok
         if not l6_ok:
             logger.warning(
                 f"  [{study_id}] VERIDAH L6 FAILED verification: {l6_reason} "
-                f"— demoting TV to L5 to prevent L4-TP measurement"
-            )
+                f"— demoting TV to L5")
             if VD_L5 in vert_unique:
                 tv_label = VD_L5
                 tv_name  = VERIDAH_NAMES[VD_L5]
-                tv_z     = get_tv_z_range(sag_vert, VD_L5) or tv_z
             else:
                 out['errors'].append('L6 verification failed and no VERIDAH L5 fallback')
                 return out
         else:
             logger.info(f"  [{study_id}] VERIDAH L6 verified ✓ — {l6_reason}")
 
-    # ── TP concordance validation ───────────────────────────────────────────────
-    # Build sacrum mask for use in concordance check and throughout Phase 1
-    tss_sac_mask = (sag_tss == TSS_SACRUM) if sag_tss is not None else None
-    sac_mask_p1  = (tss_sac_mask
-                    if tss_sac_mask is not None and tss_sac_mask.any()
-                    else (sag_sp == SP_SACRUM))
+    # ── TV Z range from TSS body (preferred) or VERIDAH ───────────────────────
+    tv_z, tv_z_source = get_tv_z_range(sag_vert, sag_tss, tv_label, study_id)
+    if tv_z is None:
+        out['errors'].append(f'TV label {tv_name} not found in TSS or VERIDAH mask')
+        return out
 
-    tp_corrected, tv_z_final = validate_tp_concordance(
-        sag_sp, sag_vert, sag_tss, vox_mm, tv_z, sac_mask_p1, study_id)
+    # ── Segmental SI axis ──────────────────────────────────────────────────────
+    # Computed once per study; both TPs share the same transitional vertebra
+    # so the disc references — and therefore the segmental axis — are identical
+    # for left and right sides.
+    seg_axis, seg_src = compute_segmental_axis(
+        sag_tss, sag_vert, tv_label, vox_mm, study_id)
 
     out['details'] = {
-        'tv_label':                   tv_label,
-        'tv_name':                    tv_name,
-        'has_l6':                     tv_label == VD_L6,
-        'l6_verified':                l6_verified if tv_label == VD_L6 else None,
-        'tv_z_range':                 list(tv_z),
-        'tp_concordance_corrected':   tp_corrected,
-        'corrected_tv_z_range':       list(tv_z_final) if tp_corrected else None,
-        'sag_vox_mm':                 vox_mm.tolist(),
-        'phase2_available':           p2_available,
-        'tp_source':                  'seg-spine_msk labels 43 (L) / 44 (R)',
-        'sacrum_source':              'TSS label 50 (preferred) / SPINEPS 26 (fallback)',
-        'label_note':                 'TSS 43/44 = L3/L4 vertebrae — TP always from seg-spine_msk',
-        'tss_lumbar_labels':          tss_lumbar_present,
+        'tv_label':              tv_label,
+        'tv_name':               tv_name,
+        'has_l6':                tv_label == VD_L6,
+        'l6_verified':           l6_verified if tv_label == VD_L6 else None,
+        'tv_z_range':            list(tv_z),
+        'tv_z_source':           tv_z_source,
+        'segmental_axis':        [round(float(v), 5) for v in seg_axis],
+        'segmental_axis_source': seg_src,
+        'sag_vox_mm':            vox_mm.tolist(),
+        'phase2_available':      p2_available,
+        'tp_source':             'seg-spine_msk labels 43 (L) / 44 (R)',
+        'sacrum_source':         'TSS label 50 (preferred) / SPINEPS 26 (fallback)',
+        'label_note':            'TSS 43/44 = L3/L4 vertebrae — TP always from seg-spine_msk',
+        'tss_lumbar_labels':     tss_lumbar_present,
     }
     logger.info(
-        f"  [{study_id}] TV={tv_name}  z=[{tv_z[0]},{tv_z[1]}]"
-        + (f"  → corrected z=[{tv_z_final[0]},{tv_z_final[1]}]" if tp_corrected else "")
+        f"  [{study_id}] TV={tv_name}  z={tv_z}  z_src={tv_z_source}\n"
+        f"             seg_axis=[{seg_axis[0]:.3f},{seg_axis[1]:.3f},{seg_axis[2]:.3f}]"
+        f"  src={seg_src}"
     )
 
-    # ── Phase 1 + 2 per side — use corrected Z range ───────────────────────────
+    # ── Phase 1 + 2 per side ───────────────────────────────────────────────────
     for side, tp_lbl in (('left', SP_TP_L), ('right', SP_TP_R)):
         try:
-            p1 = phase1_sagittal(side, tp_lbl, sag_sp, sag_tss, vox_mm, tv_z_final)
+            p1 = phase1_sagittal(
+                side, tp_lbl, sag_sp, sag_tss, vox_mm, tv_z,
+                seg_axis, seg_src)
+
             logger.info(
                 f"  {side:5s} P1: {p1['classification']:22s} "
                 f"h={p1['tp_height_mm']:.1f}mm  "
                 f"d={p1['dist_mm']:.1f}mm  "
+                f"|cosθ|={p1.get('tp_axis_cos_segmental','?')}  "
+                f"Δ={p1.get('tp_axis_deg_from_segmental','?')}°  "
                 f"z=[{p1.get('tp_z_min_vox','?')},{p1.get('tp_z_max_vox','?')}]  "
-                f"cz={p1.get('tp_centroid_z_mm','?')}mm  "
                 f"sac={p1.get('sacrum_source','?')}"
             )
 
             if p1['contact'] and p2_available:
                 p2 = phase2_axial(side, tp_lbl, ax_sp, ax_tss, ax_t2w, ax_vox_mm)
-                p1['phase2']        = p2
-                p1['classification']= p2['classification']
+                p1['phase2']         = p2
+                p1['classification'] = p2['classification']
                 logger.info(f"  {side:5s} P2: {p2['classification']}  "
                             f"valid={p2.get('p2_valid')}  "
                             f"reason={p2.get('p2_features', {}).get('reason','?')}")
@@ -911,14 +1087,12 @@ def classify_study(study_id:       str,
         logger.info(f"  ✗ [{study_id}] No Castellvi finding")
 
     # ── Extended LSTV morphometrics ─────────────────────────────────────────────
-    # Run regardless of Castellvi — count anomaly and disc metrics may detect LSTV
     if run_morpho:
         try:
             masks  = load_lstv_masks(study_id, spineps_dir, totalspine_dir)
             morpho = analyze_lstv(masks, castellvi_result=out)
             out['lstv_morphometrics'] = morpho.to_dict()
 
-            # ── Count-anomaly and phenotype-based LSTV flags ────────────────────
             consensus = morpho.lumbar_count_consensus
             phenotype = morpho.lstv_phenotype or 'normal'
 
@@ -938,7 +1112,6 @@ def classify_study(study_id:       str,
                 reason  = (f"Phenotype: {phenotype.upper()} "
                            f"({morpho.phenotype_confidence} confidence) — "
                            f"criteria: {'; '.join(primary)}")
-                # Only add if not already captured by count anomaly
                 if not any('Phenotype' in r for r in out['lstv_reason']):
                     out['lstv_reason'].append(reason)
                 logger.info(f"  ✓ [{study_id}] LSTV: {reason}")
@@ -964,6 +1137,8 @@ def classify_study(study_id:       str,
     wl_risk     = sr_dict.get('wrong_level_risk', '?')
     bert_prob   = sr_dict.get('bertolotti_probability', 0)
     rdr         = morpho_dict.get('relative_disc_ratio')
+    deg_l       = out['left'].get('tp_axis_deg_from_segmental', '?')
+    deg_r       = out['right'].get('tp_axis_deg_from_segmental', '?')
 
     if out['lstv_detected']:
         ph_str = ''
@@ -972,12 +1147,11 @@ def classify_study(study_id:       str,
                       f"({morpho_dict.get('phenotype_confidence','')})")
         logger.info(
             f"  ✓✓ [{study_id}] LSTV DETECTED  "
-            f"Castellvi={out.get('castellvi_type','None')}  "
-            f"{ph_str}  "
+            f"Castellvi={out.get('castellvi_type','None')}  {ph_str}  "
             f"P(sac)={p_sac:.0%}  P(lumb)={p_lumb:.0%}  P(norm)={p_norm:.0%}  "
             f"surgical_risk={wl_risk}  bertolotti={bert_prob:.0%}"
             + (f"  disc_ratio={rdr:.2f}" if rdr is not None else "")
-            + (f"  [TP-FIXED]" if tp_corrected else "")
+            + f"  axis_dev={deg_l}°/{deg_r}° (L/R)"
         )
     else:
         logger.info(
@@ -1054,13 +1228,13 @@ def main() -> int:
 
     logger.info(f"Processing {len(study_ids)} studies")
 
-    results: List[dict] = []
-    errors              = 0
-    castellvi_counts    = {k: 0 for k in
-                           ['Type Ia','Type Ib','Type IIa','Type IIb',
-                            'Type IIIa','Type IIIb','Type IV']}
+    results: List[dict]  = []
+    errors               = 0
+    castellvi_counts     = {k: 0 for k in
+                            ['Type Ia','Type Ib','Type IIa','Type IIb',
+                             'Type IIIa','Type IIIb','Type IV']}
     phenotype_counts: Dict[str, int] = {}
-    tp_correction_count = 0
+    axis_deviations: List[float]     = []   # per-TP axis-vs-segmental angle (deg)
 
     for sid in study_ids:
         logger.info(f"\n{'='*60}\n[{sid}]")
@@ -1071,7 +1245,6 @@ def main() -> int:
             )
             results.append(r)
             if r.get('errors'): errors += 1
-            if r.get('details', {}).get('tp_concordance_corrected'): tp_correction_count += 1
             ct = r.get('castellvi_type') or ''
             for k in castellvi_counts:
                 if ct.replace(' ', '') == k.replace(' ', ''):
@@ -1079,6 +1252,10 @@ def main() -> int:
             morpho = r.get('lstv_morphometrics') or {}
             ph = morpho.get('lstv_phenotype', 'normal')
             phenotype_counts[ph] = phenotype_counts.get(ph, 0) + 1
+            for side in ('left', 'right'):
+                deg = r.get(side, {}).get('tp_axis_deg_from_segmental')
+                if deg is not None:
+                    axis_deviations.append(float(deg))
         except Exception as exc:
             logger.error(f"  Unhandled: {exc}")
             logger.debug(traceback.format_exc())
@@ -1091,54 +1268,52 @@ def main() -> int:
         key=lambda t: t[1], reverse=True,
     )
 
-    # ── Probability distribution statistics ────────────────────────────────────
     p_sac_vals  = []
     p_lumb_vals = []
     wl_risk_counts: Dict[str, int] = {}
     bertolotti_ge50 = 0
-    high_cert_sac  = 0   # P(sac)  > 0.80
-    high_cert_lumb = 0   # P(lumb) > 0.80
-    nerve_ambig    = 0
-    rel_disc_low   = 0   # relative_disc_ratio < 0.65
+    high_cert_sac   = 0
+    high_cert_lumb  = 0
+    nerve_ambig     = 0
+    rel_disc_low    = 0
 
     for r in results:
         morpho = r.get('lstv_morphometrics') or {}
         probs  = morpho.get('probabilities') or {}
         ps = probs.get('p_sacralization', 0)
         pl = probs.get('p_lumbarization', 0)
-        p_sac_vals.append(ps)
-        p_lumb_vals.append(pl)
-        if ps > 0.80:  high_cert_sac  += 1
-        if pl > 0.80:  high_cert_lumb += 1
-
-        sr = morpho.get('surgical_relevance') or {}
+        p_sac_vals.append(ps); p_lumb_vals.append(pl)
+        if ps > 0.80: high_cert_sac  += 1
+        if pl > 0.80: high_cert_lumb += 1
+        sr  = morpho.get('surgical_relevance') or {}
         wlr = sr.get('wrong_level_risk', 'low')
         wl_risk_counts[wlr] = wl_risk_counts.get(wlr, 0) + 1
         if sr.get('nerve_root_ambiguity'): nerve_ambig += 1
-        bp = sr.get('bertolotti_probability', 0)
-        if bp >= 0.50: bertolotti_ge50 += 1
-
+        if sr.get('bertolotti_probability', 0) >= 0.50: bertolotti_ge50 += 1
         rdr = morpho.get('relative_disc_ratio')
         if rdr is not None and rdr < 0.65: rel_disc_low += 1
 
-    # ── Print summary ──────────────────────────────────────────────────────────
     sep = '=' * 60
     logger.info(f"\n{sep}")
     logger.info(f"{'LSTV DETECTION SUMMARY':^60}")
     logger.info(f"{sep}")
-
     logger.info(f"Studies processed:        {len(results)}")
     logger.info(f"LSTV detected:            {lstv_n}  ({100*lstv_n/n:.1f}%)")
     logger.info(f"  Sacralization:          {phenotype_counts.get('sacralization',0)}")
     logger.info(f"  Lumbarization:          {phenotype_counts.get('lumbarization',0)}")
-    n_trans = phenotype_counts.get('transitional_indeterminate', 0)
-    logger.info(f"  Transitional:           {n_trans}"
-                + ("  [NOTE: Castellvi and Transitional phenotype are orthogonal —"
-                   " Castellvi alone meets sacralization threshold via sac_score≥4]"
-                   if n_trans == 0 and sum(castellvi_counts.values()) > 0 else ""))
+    logger.info(f"  Transitional:           {phenotype_counts.get('transitional_indeterminate',0)}")
     logger.info(f"  Normal:                 {phenotype_counts.get('normal',0)}")
     logger.info(f"Errors:                   {errors}")
-    logger.info(f"TP concordance fixes:     {tp_correction_count}")
+
+    if axis_deviations:
+        logger.info(f"\n── Segmental Axis QA (TP principal axis vs segmental SI) ─")
+        logger.info(f"  mean={np.mean(axis_deviations):.1f}°  "
+                    f"median={np.median(axis_deviations):.1f}°  "
+                    f"max={np.max(axis_deviations):.1f}°  "
+                    f"n_TPs={len(axis_deviations)}")
+        n_dev = sum(1 for d in axis_deviations if d > 20.0)
+        logger.info(f"  TPs deviating >20° from segmental axis: "
+                    f"{n_dev} ({100*n_dev/len(axis_deviations):.1f}%)")
 
     logger.info(f"\n── Castellvi Type Breakdown ──────────────────────────────")
     for t, cnt in castellvi_counts.items():
@@ -1148,49 +1323,39 @@ def main() -> int:
 
     logger.info(f"\n── Probability Model Statistics ──────────────────────────")
     if p_sac_vals:
-        arr_s = [v for v in p_sac_vals if v > 0]
-        arr_l = [v for v in p_lumb_vals if v > 0]
-        logger.info(f"  P(sacralization):  mean={float(np.mean(p_sac_vals)):.2%}  "
-                    f"median={float(np.median(p_sac_vals)):.2%}  "
-                    f">80%: {high_cert_sac} studies")
-        logger.info(f"  P(lumbarization):  mean={float(np.mean(p_lumb_vals)):.2%}  "
-                    f"median={float(np.median(p_lumb_vals)):.2%}  "
-                    f">80%: {high_cert_lumb} studies")
-        logger.info(f"  Relative disc ratio < 0.65 (Farshad-Amacker):  {rel_disc_low} studies")
+        logger.info(f"  P(sacralization):  mean={np.mean(p_sac_vals):.2%}  "
+                    f"median={np.median(p_sac_vals):.2%}  >80%: {high_cert_sac}")
+        logger.info(f"  P(lumbarization):  mean={np.mean(p_lumb_vals):.2%}  "
+                    f"median={np.median(p_lumb_vals):.2%}  >80%: {high_cert_lumb}")
+        logger.info(f"  Relative disc ratio <0.65: {rel_disc_low} studies")
 
     logger.info(f"\n── Surgical Risk Distribution ────────────────────────────")
     for risk_lvl in ('critical', 'high', 'moderate', 'low-moderate', 'low'):
         cnt = wl_risk_counts.get(risk_lvl, 0)
         if cnt: logger.info(f"  {risk_lvl:14s}: {cnt} studies  ({100*cnt/n:.1f}%)")
-    logger.info(f"  Nerve root ambiguity:   {nerve_ambig} studies")
-    logger.info(f"  Bertolotti P≥50%:       {bertolotti_ge50} studies")
+    logger.info(f"  Nerve root ambiguity:   {nerve_ambig}")
+    logger.info(f"  Bertolotti P≥50%:       {bertolotti_ge50}")
 
     logger.info(f"\n── Top-10 Pathology Scores ───────────────────────────────")
     for sid, sc in scores[:10]:
-        r_match = next((r for r in results if r['study_id'] == sid), {})
-        morpho  = r_match.get('lstv_morphometrics') or {}
-        probs   = morpho.get('probabilities') or {}
-        sr      = morpho.get('surgical_relevance') or {}
-        ph      = morpho.get('lstv_phenotype', '?')
-        ct      = r_match.get('castellvi_type', 'None')
-        fix     = ' [TP-FIXED]' if r_match.get('details', {}).get('tp_concordance_corrected') else ''
-        ps      = probs.get('p_sacralization', 0)
-        pl      = probs.get('p_lumbarization', 0)
-        wl      = sr.get('wrong_level_risk', '?')
-        bp      = sr.get('bertolotti_probability', 0)
-        sr_fb   = ' [SR-fallback]' if sr.get('calibration_note', '').startswith('fallback') else ''
-        rdr     = morpho.get('relative_disc_ratio')
-        rdr_str = f'  disc_ratio={rdr:.2f}' if rdr is not None else ''
+        r_m  = next((r for r in results if r['study_id'] == sid), {})
+        mo   = r_m.get('lstv_morphometrics') or {}
+        pr   = mo.get('probabilities') or {}
+        sr   = mo.get('surgical_relevance') or {}
+        rdr  = mo.get('relative_disc_ratio')
+        srfb = ' [SR-fallback]' if sr.get('calibration_note','').startswith('fallback') else ''
         logger.info(
-            f"  {sid}: score={sc:.1f}  {ph}  castellvi={ct}  "
-            f"P(sac)={ps:.0%}  P(lumb)={pl:.0%}  "
-            f"surgical_risk={wl}  bertolotti={bp:.0%}"
-            f"{rdr_str}{fix}{sr_fb}"
+            f"  {sid}: score={sc:.1f}  {mo.get('lstv_phenotype','?')}  "
+            f"castellvi={r_m.get('castellvi_type','None')}  "
+            f"P(sac)={pr.get('p_sacralization',0):.0%}  "
+            f"P(lumb)={pr.get('p_lumbarization',0):.0%}  "
+            f"surgical_risk={sr.get('wrong_level_risk','?')}  "
+            f"bertolotti={sr.get('bertolotti_probability',0):.0%}"
+            + (f"  disc_ratio={rdr:.2f}" if rdr is not None else "")
+            + srfb
         )
-
     logger.info(f"\n{sep}")
 
-    # ── Write results ──────────────────────────────────────────────────────────
     out_json = output_dir / 'lstv_results.json'
     with open(out_json, 'w') as fh:
         json.dump(results, fh, indent=2, default=str)
@@ -1200,16 +1365,21 @@ def main() -> int:
         'lstv_detected':                lstv_n,
         'lstv_rate':                    round(lstv_n / n, 4),
         'errors':                       errors,
-        'tp_concordance_fixes':         tp_correction_count,
         'castellvi_breakdown':          castellvi_counts,
         'phenotype_breakdown':          phenotype_counts,
-        # v4 additions
         'probability_stats': {
             'mean_p_sacralization':     round(float(np.mean(p_sac_vals)), 4) if p_sac_vals else None,
             'mean_p_lumbarization':     round(float(np.mean(p_lumb_vals)), 4) if p_lumb_vals else None,
             'high_confidence_sac':      high_cert_sac,
             'high_confidence_lumb':     high_cert_lumb,
             'relative_disc_ratio_low':  rel_disc_low,
+        },
+        'segmental_axis_qa': {
+            'n_tps_measured':   len(axis_deviations),
+            'mean_dev_deg':     round(float(np.mean(axis_deviations)),   2) if axis_deviations else None,
+            'median_dev_deg':   round(float(np.median(axis_deviations)), 2) if axis_deviations else None,
+            'max_dev_deg':      round(float(np.max(axis_deviations)),    2) if axis_deviations else None,
+            'n_dev_gt20deg':    sum(1 for d in axis_deviations if d > 20.0),
         },
         'surgical_risk_breakdown':      wl_risk_counts,
         'nerve_root_ambiguity_count':   nerve_ambig,
