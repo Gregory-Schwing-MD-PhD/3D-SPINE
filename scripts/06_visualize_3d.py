@@ -32,18 +32,31 @@ v5.2 CHANGES vs v5.1:
   4. ANGLE PANEL (right sidebar, from v5.1, retained):
        δ, C, A, B, D, D1 with color-coded threshold badges.
 
+  CLI: batch mode with --rank_by lstv / --all / --study_id (underscore args,
+       matching the v5 batch runner). JSON format: list of dicts each with
+       a 'study_id' key, or dict keyed by study_id.
+
 OUTPUT
 ------
   {output_dir}/{study_id}_lstv_3d.html  — self-contained Plotly HTML
 
-USAGE
+USAGE — single study
 -----
   python 06_visualize_3d.py \\
-      --study-id SUB-001 \\
-      --spineps-dir /data/spineps \\
-      --totalspine-dir /data/totalspine \\
-      --lstv-json /data/results/SUB-001_lstv.json \\
-      --output-dir /data/visualizations
+      --study_id SUB-001 \\
+      --spineps_dir /data/spineps \\
+      --totalspine_dir /data/totalspine \\
+      --lstv_json /data/results/lstv_results.json \\
+      --output_dir /data/visualizations
+
+USAGE — batch (top 10 pathologic + 1 normal)
+-----
+  python 06_visualize_3d.py \\
+      --spineps_dir /data/spineps \\
+      --totalspine_dir /data/totalspine \\
+      --lstv_json /data/results/lstv_results.json \\
+      --output_dir /data/visualizations \\
+      --rank_by lstv --top_n 10 --top_normal 1
 """
 
 from __future__ import annotations
@@ -52,6 +65,7 @@ import argparse
 import json
 import logging
 import math
+import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -83,6 +97,7 @@ VD_L1=20; VD_L2=21; VD_L3=22; VD_L4=23; VD_L5=24; VD_L6=25; VD_SAC=26
 # ── Morphology thresholds ─────────────────────────────────────────────────────
 TP_HEIGHT_MM    = 19.0
 CONTACT_DIST_MM = 2.0
+EXPECTED_LUMBAR = 5
 
 # ── RENDER CONFIG ─────────────────────────────────────────────────────────────
 SP_RENDER: List[Tuple[int, str, str, float]] = [
@@ -205,7 +220,7 @@ def _mesh_to_plotly(verts: np.ndarray, faces: np.ndarray,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# BASIC GEOMETRY / TP RULER HELPERS  (unchanged from v5.1)
+# BASIC GEOMETRY / TP RULER HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _centroid(vol: np.ndarray, label: int) -> Optional[np.ndarray]:
@@ -290,7 +305,7 @@ def _plane_trace(center: np.ndarray, normal: np.ndarray,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ANGLE PANEL HTML  (sidebar — unchanged from v5.1)
+# ANGLE PANEL HTML  (sidebar)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _angle_color(angle: Optional[float], threshold: float,
@@ -442,20 +457,10 @@ def _endplate_line(
     z_c    = float(center[2])
     anchor = np.array([x_mid, y_dorsal, z_c])
 
-    # Endplate tilt: the line is perpendicular to the normal projected into YZ.
-    # In the sagittal plane the endplate direction tangent is (0, nz, -ny)
-    # (90° rotation of normal in YZ).  We project onto Z only because Y is fixed.
     ny = float(normal[1]); nz = float(normal[2])
-    # Tangent in sagittal: dz component from normal
-    # A horizontal endplate has normal=(0,0,1) → tangent=(0,1,0) → dz_tilt=0
-    # A tilted endplate normal=(0, sin θ, cos θ) → tangent=(0, cos θ, -sin θ)
-    # tilt in Z per unit extension = -ny / (nz+eps)
-    dz_tilt = -ny / (abs(nz) + 1e-4)   # ΔZ per ΔY=1; but Y is fixed so we tilt in Z
-    # clamp extreme tilts
+    dz_tilt = -ny / (abs(nz) + 1e-4)
     dz_tilt = float(np.clip(dz_tilt, -1.5, 1.5))
 
-    # p0 = caudal end, p1 = cranial end
-    # We extend purely in Z, with a small tilt correction
     p0 = np.array([x_mid, y_dorsal, z_c - half_len + dz_tilt * half_len * 0.3])
     p1 = np.array([x_mid, y_dorsal, z_c + half_len + dz_tilt * half_len * 0.3])
     return anchor, p0, p1
@@ -548,7 +553,6 @@ def _arc_slerp(
 
     xs, ys, zs = [], [], []
     if theta < 1e-6:
-        # Vectors are parallel — degenerate arc, just return the single point
         p = apex + radius * s1
         return ([float(p[0])], [float(p[1])], [float(p[2])])
 
@@ -558,7 +562,6 @@ def _arc_slerp(
         w1 = math.sin((1.0 - t) * theta) / sin_t
         w2 = math.sin(t          * theta) / sin_t
         s  = w1 * s1 + w2 * s2
-        # s is already unit-length by slerp construction; normalise for safety
         sn = np.linalg.norm(s)
         if sn > 1e-9:
             s /= sn
@@ -628,15 +631,12 @@ def build_angle_overlays_3d(
     c_tv1,  n_tv1  = _cn(tv1_tss, tv1_vd, 'superior') if tv1_vd else (None, None)
     c_l3,   n_l3   = _cn(43, VD_L3, 'superior')
 
-    # Determine shared Y anchor — use minimum across all needed labels
+    # Determine shared Y anchor
     y_vals = [_py(TSS_SACRUM, VD_SAC)]
     if tv_tss:    y_vals.append(_py(tv_tss, tv_vd_label))
     if tv1_tss:   y_vals.append(_py(tv1_tss, tv1_vd))
-    y_base = min(y_vals)  # furthest posterior label surface - DORSAL_OFFSET
+    y_base = min(y_vals)
 
-    # Each angle band sits at a distinct dorsal depth:
-    #   δ furthest (y_base - 24), D1 (y_base - 16), D (y_base - 8),
-    #   C/B/A closer to spine (y_base)
     Y = {
         'delta': y_base - 24.0,
         'D1':    y_base - 16.0,
@@ -646,20 +646,17 @@ def build_angle_overlays_3d(
         'A':     y_base + 2.0,
     }
 
-    # ── helpers ───────────────────────────────────────────────────────────────
     def _overlay(label: str, center_a, normal_a, center_b, normal_b,
                   color: str, val: Optional[float],
                   line_w: int, arc_r: float,
                   name_a: str, name_b: str,
                   flag_str: str = '',
                   show_vert_connector: bool = True) -> None:
-        """Render one angle overlay: two endplate lines + arc + label."""
         y_d = Y[label]
         anc_a, pa0, pa1 = _endplate_line(center_a, normal_a, x_mid, y_d)
         anc_b, pb0, pb1 = _endplate_line(center_b, normal_b, x_mid, y_d)
 
         if show_vert_connector:
-            # Dashed vertical connecting the two anchor Z levels at the dorsal plane
             va = np.array([x_mid, y_d, float(center_a[2])])
             vb = np.array([x_mid, y_d, float(center_b[2])])
             traces.append(_line3d_trace(va, vb, '#888888', 2,
@@ -671,7 +668,6 @@ def build_angle_overlays_3d(
                                      show_legend=False))
         traces.append(_dot3d_trace(anc_a, color, DOT_SIZE))
 
-        # Arc — slerp between the two line directions
         da = pa1 - pa0; da /= np.linalg.norm(da) + 1e-9
         db = pb1 - pb0; db /= np.linalg.norm(db) + 1e-9
         ax, ay, az = _arc_slerp(anc_a, da, db, arc_r)
@@ -683,15 +679,12 @@ def build_angle_overlays_3d(
             traces.append(_label3d_trace(lbl_pos, lbl_text, color,
                                           size=15 if label == 'δ' else 12))
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # A-ANGLE (yellow) — sacral superior surface vs vertical reference
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     a_val = angles.get('a_angle_deg')
     if c_sac is not None and n_sac is not None and a_val is not None:
         col  = '#ffdd00'
         y_d  = Y['A']
         anc, p0, p1 = _endplate_line(c_sac, n_sac, x_mid, y_d, LINE_HALF_LEN * 1.1)
-        # Vertical reference line
         vert_up   = anc + np.array([0., 0.,  LINE_HALF_LEN * 0.85])
         vert_down = anc + np.array([0., 0., -LINE_HALF_LEN * 0.45])
         traces.append(_line3d_trace(p0, p1, col, LINE_WIDTH_PRI, 'A: sacral surface'))
@@ -705,9 +698,7 @@ def build_angle_overlays_3d(
         lp = anc + np.array([0., -ARC_R_LARGE * 1.5, ARC_R_LARGE * 0.5])
         traces.append(_label3d_trace(lp, f'A={a_val:.1f}°', col, 12))
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # B-ANGLE (red) — L3 superior vs sacral superior
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     b_val = angles.get('b_angle_deg')
     if (c_sac is not None and c_l3 is not None
             and n_sac is not None and n_l3 is not None and b_val is not None):
@@ -715,9 +706,7 @@ def build_angle_overlays_3d(
                  '#ff4444', b_val, LINE_WIDTH_PRI, ARC_R_LARGE * 0.9,
                  'B: sacral ref', 'B: L3 endplate')
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # C-ANGLE (magenta) — posterior body lines, largest pair
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     c_val = angles.get('c_angle_deg')
     if c_val is not None:
         col_c     = '#ff44ff'
@@ -769,7 +758,6 @@ def build_angle_overlays_3d(
             z_mid  = float((c0[2] + c1[2]) / 2)
             anc_C  = np.array([x_mid, y_C, z_mid])
 
-            # Vertical reference (yellow dashed, like Fig 1b)
             vr_a = anc_C + np.array([0., 0.,  LINE_HALF_LEN * 0.8])
             vr_b = anc_C + np.array([0., 0., -LINE_HALF_LEN * 0.4])
             traces.append(_line3d_trace(vr_b, vr_a, '#ffdd00', LINE_WIDTH_SEC,
@@ -790,27 +778,21 @@ def build_angle_overlays_3d(
             lp = anc_C + np.array([0., -ARC_R_LARGE * 1.4, ARC_R_LARGE * 0.2])
             traces.append(_label3d_trace(lp, f'C={c_val:.1f}°{flag_c}', col_lbl, 13))
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # D-ANGLE (orange) — TV superior vs S1 superior
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     d_val = angles.get('d_angle_deg')
     if d_val is not None and c_tv is not None and c_sac is not None:
         _overlay('D', c_tv, n_tv, c_sac, n_sac,
                  '#ff8800', d_val, LINE_WIDTH_PRI, ARC_R_SMALL,
                  'D: TV sup endplate', 'D: S1 sup endplate')
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # D1-ANGLE (cyan) — TV-1 superior vs TV superior
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     d1_val = angles.get('d1_angle_deg')
     if d1_val is not None and c_tv1 is not None and c_tv is not None:
         _overlay('D1', c_tv1, n_tv1, c_tv, n_tv,
                  '#00ccff', d1_val, LINE_WIDTH_PRI, ARC_R_SMALL,
                  'D1: TV-1 endplate', 'D1: TV endplate ref')
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # DELTA (white/red) — most prominent, furthest dorsal
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     de_val = angles.get('delta_angle_deg')
     if de_val is not None and c_tv is not None and c_tv1 is not None:
         triggered = de_val <= DELTA_THRESHOLD
@@ -1136,67 +1118,188 @@ def _render_html(study_id: str,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CLI
+# STUDY RANKING  (from v5 batch runner)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description='LSTV 3D Visualization v5.2')
-    p.add_argument('--study-id',       required=True)
-    p.add_argument('--spineps-dir',    required=True, type=Path)
-    p.add_argument('--totalspine-dir', required=True, type=Path)
-    p.add_argument('--lstv-json',      required=True, type=Path)
-    p.add_argument('--output-dir',     required=True, type=Path)
-    p.add_argument('--no-tss',   action='store_true')
-    p.add_argument('--show-vd',  action='store_true')
-    p.add_argument('--step-size', type=int, default=2)
-    p.add_argument('--log-level', default='INFO',
-                   choices=['DEBUG','INFO','WARNING','ERROR'])
-    return p
-
-
-def main() -> None:
-    args = _build_arg_parser().parse_args()
-    logging.basicConfig(level=getattr(logging, args.log_level),
-                        format='%(asctime)s %(levelname)-8s %(message)s',
-                        datefmt='%H:%M:%S')
-    sid      = args.study_id
-    seg      = args.spineps_dir / 'segmentations' / sid
-    sp_path  = seg / f'{sid}_seg-spine_msk.nii.gz'
-    vt_path  = seg / f'{sid}_seg-vert_msk.nii.gz'
-    tss_path = (args.totalspine_dir / sid / 'sagittal'
-                / f'{sid}_sagittal_labeled.nii.gz')
-
-    logger.info(f'[{sid}] Loading masks...')
-    sp_vol   = _load_canonical_iso(sp_path)
-    vert_vol = _load_canonical_iso(vt_path)
-    tss_vol  = None
-    if not args.no_tss and tss_path.exists():
-        try:
-            tss_vol = _load_canonical_iso(tss_path)
-        except Exception as exc:
-            logger.warning(f'TSS load failed: {exc}')
-
-    with open(args.lstv_json) as fh:
-        lstv_result = json.load(fh)
-    if sid in lstv_result:
-        lstv_result = lstv_result[sid]
-
-    logger.info(f'[{sid}] Building visualization...')
-    html = build_lstv_visualization(
-        study_id    = sid,
-        sp_vol      = sp_vol,
-        vert_vol    = vert_vol,
-        tss_vol     = tss_vol,
-        lstv_result = lstv_result,
-        show_tss    = not args.no_tss,
-        show_vd     = args.show_vd,
-        step_size   = args.step_size,
+def rank_studies(results: List[dict],
+                 n_pathologic: int,
+                 n_normal: int) -> Tuple[List[str], List[str]]:
+    scored = sorted(
+        ((r['study_id'], r.get('pathology_score') or 0) for r in results),
+        key=lambda t: t[1], reverse=True,
     )
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    out = args.output_dir / f'{sid}_lstv_3d.html'
-    out.write_text(html, encoding='utf-8')
-    logger.info(f'[{sid}] Saved → {out}')
+    pathologic_ids = {sid for sid, _ in scored[:n_pathologic]}
+    pathologic     = [sid for sid, _ in scored[:n_pathologic]]
+    result_by_id   = {r['study_id']: r for r in results}
+
+    def _is_normal(sid):
+        r = result_by_id.get(sid, {})
+        if r.get('lstv_detected'): return False
+        cnt = (r.get('lstv_morphometrics') or {}).get('lumbar_count_consensus')
+        if cnt is not None and cnt != EXPECTED_LUMBAR: return False
+        if (r.get('pathology_score') or 0) > 0: return False
+        return True
+
+    normal_pool = [(sid, sc) for sid, sc in reversed(scored)
+                   if sid not in pathologic_ids and _is_normal(sid)]
+    if len(normal_pool) < n_normal:
+        extra = [(sid, sc) for sid, sc in reversed(scored)
+                 if sid not in pathologic_ids and sid not in {s for s, _ in normal_pool}]
+        normal_pool = (normal_pool + extra)[:n_normal]
+
+    normal = [sid for sid, _ in normal_pool[:n_normal]]
+    return pathologic, normal
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CLI  (underscore args, batch-capable — matches v5 SLURM runner)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description='LSTV 3D Visualization v5.2')
+    parser.add_argument('--spineps_dir',    required=True, type=Path)
+    parser.add_argument('--totalspine_dir', required=True, type=Path)
+    parser.add_argument('--output_dir',     required=True, type=Path)
+    parser.add_argument('--lstv_json',      default=None,  type=Path)
+    parser.add_argument('--study_id',       default=None)
+    parser.add_argument('--all',            action='store_true',
+                        help='Render every study in spineps_dir/segmentations/')
+    parser.add_argument('--rank_by',        default='lstv',
+                        choices=['lstv', 'all'],
+                        help='lstv = top_n by pathology score; all = same as --all')
+    parser.add_argument('--top_n',          type=int, default=10,
+                        help='Number of most-pathologic studies to render')
+    parser.add_argument('--top_normal',     type=int, default=1,
+                        help='Number of most-normal (score=0) studies to render')
+    parser.add_argument('--smooth',         type=float, default=2.0)
+    parser.add_argument('--no_tss',         action='store_true')
+    parser.add_argument('--show_vd',        action='store_true')
+    parser.add_argument('--step_size',      type=int, default=2)
+    parser.add_argument('--log_level',      default='INFO',
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
+    args = parser.parse_args()
+
+    logging.basicConfig(level=getattr(logging, args.log_level),
+                        format='%(asctime)s  %(levelname)-7s  %(message)s')
+
+    spineps_dir    = args.spineps_dir
+    totalspine_dir = args.totalspine_dir
+    output_dir     = args.output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
+    seg_root = spineps_dir / 'segmentations'
+
+    # ── JSON loading (list-of-dicts or dict-keyed-by-study_id) ────────────────
+    all_results:   List[dict]     = []
+    result_by_id:  Dict[str, dict] = {}
+
+    if args.lstv_json and args.lstv_json.exists():
+        with open(args.lstv_json) as fh:
+            raw = json.load(fh)
+        if isinstance(raw, list):
+            all_results = raw
+        else:
+            # dict keyed by study_id → convert to list format
+            all_results = [{'study_id': k, **v} for k, v in raw.items()]
+        result_by_id = {str(r['study_id']): r for r in all_results}
+        logger.info(f'Loaded {len(all_results)} results from {args.lstv_json}')
+    elif args.lstv_json:
+        logger.warning(f'lstv_json not found: {args.lstv_json}')
+
+    # ── Study selection ────────────────────────────────────────────────────────
+    if args.study_id:
+        study_ids = [args.study_id]
+        logger.info(f'Single-study mode: {args.study_id}')
+
+    elif args.all or args.rank_by == 'all':
+        study_ids = sorted(d.name for d in seg_root.iterdir() if d.is_dir())
+        logger.info(f'Rendering all {len(study_ids)} studies in {seg_root}')
+
+    elif args.rank_by == 'lstv':
+        if not all_results:
+            parser.error('--rank_by lstv requires --lstv_json with valid data')
+        pathologic, normal = rank_studies(all_results, args.top_n, args.top_normal)
+        seen = set(pathologic)
+        study_ids = pathologic + [s for s in normal if s not in seen]
+        study_ids = [s for s in study_ids if (seg_root / s).is_dir()]
+        logger.info(
+            f'Ranked selection: {len(pathologic)} pathologic + {len(normal)} normal '
+            f'= {len(study_ids)} studies')
+        for sid in pathologic:
+            sc = result_by_id.get(sid, {}).get('pathology_score', 0)
+            logger.info(f'  pathologic: {sid}  score={sc:.1f}')
+        for sid in normal:
+            sc = result_by_id.get(sid, {}).get('pathology_score') or 0
+            logger.info(f'  normal:     {sid}  score={sc:.1f}')
+
+    else:
+        parser.error("Use --study_id, --all, or --rank_by lstv")
+
+    if not study_ids:
+        logger.error('No studies to render — check paths and lstv_json')
+        return 1
+
+    # ── Per-study rendering ────────────────────────────────────────────────────
+    ok = 0
+    for sid in study_ids:
+        logger.info(f"\n{'='*60}\n[{sid}] Rendering...")
+        try:
+            seg      = spineps_dir / 'segmentations' / sid
+            sp_path  = seg / f'{sid}_seg-spine_msk.nii.gz'
+            vt_path  = seg / f'{sid}_seg-vert_msk.nii.gz'
+            tss_path = (totalspine_dir / sid / 'sagittal'
+                        / f'{sid}_sagittal_labeled.nii.gz')
+
+            if not sp_path.exists():
+                logger.warning(f'  [{sid}] Missing seg-spine_msk, skipping')
+                continue
+            if not vt_path.exists():
+                logger.warning(f'  [{sid}] Missing seg-vert_msk, skipping')
+                continue
+
+            sp_vol   = _load_canonical_iso(sp_path)
+            vert_vol = _load_canonical_iso(vt_path)
+            tss_vol  = None
+            if not args.no_tss and tss_path.exists():
+                try:
+                    tss_vol = _load_canonical_iso(tss_path)
+                except Exception as exc:
+                    logger.warning(f'  [{sid}] TSS load failed: {exc}')
+
+            lstv_result = result_by_id.get(sid, {
+                'study_id':      sid,
+                'lstv_detected': False,
+                'lstv_reason':   [],
+                'castellvi_type': None,
+                'left': {}, 'right': {},
+                'lstv_morphometrics': None,
+                'pathology_score': 0,
+            })
+
+            html = build_lstv_visualization(
+                study_id    = sid,
+                sp_vol      = sp_vol,
+                vert_vol    = vert_vol,
+                tss_vol     = tss_vol,
+                lstv_result = lstv_result,
+                show_sp     = True,
+                show_tss    = not args.no_tss,
+                show_vd     = args.show_vd,
+                step_size   = args.step_size,
+            )
+
+            out = output_dir / f'{sid}_lstv_3d.html'
+            out.write_text(html, encoding='utf-8')
+            logger.info(f'  [{sid}] Saved → {out}  ({out.stat().st_size / 1e6:.1f} MB)')
+            ok += 1
+
+        except Exception as exc:
+            logger.error(f'  [{sid}] FAILED: {exc}')
+            logger.debug(traceback.format_exc())
+
+    logger.info(f'\nDone. {ok}/{len(study_ids)} HTMLs written → {output_dir}')
+    return 0 if ok == len(study_ids) else 1
 
 
 if __name__ == '__main__':
-    main()
+    import sys
+    sys.exit(main())
