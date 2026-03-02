@@ -1,6 +1,6 @@
 # lstv-detector
 
-**Automated MRI-based detection and classification of Lumbosacral Transitional Vertebrae (LSTV) using deep learning segmentation, radiologically-grounded morphometrics, and interactive 3D visualisation.**
+**Automated MRI-based detection and classification of Lumbosacral Transitional Vertebrae (LSTV) using deep learning segmentation, radiologically-grounded morphometrics, vertebral angle analysis, and interactive 3D visualisation.**
 
 > Target audience: spine neurosurgeons, musculoskeletal radiologists, and deep learning researchers working with spinal MRI.
 
@@ -52,6 +52,65 @@ The Castellvi system (Castellvi et al., *Spine* 1984;9(1):31–35) classifies TP
 
 ---
 
+## Vertebral Angle Analysis (Seilanian Toosi 2025) — NEW in v5.x
+
+This pipeline implements the full five-angle measurement system introduced by Seilanian Toosi et al. (*Arch Bone Jt Surg.* 2025;13(5):271–280), computed automatically from 3D segmentation masks on the reconstructed midsagittal slice.
+
+### Angle Definitions
+
+All angles are measured on the midsagittal view, exactly as illustrated in the paper figures. The pipeline reconstructs an optimal midsagittal 2D slice from the 3D segmentation via maximum-intensity projection of a 10mm midline slab.
+
+| Angle | Definition | Normal Median | LSTV Direction |
+|-------|-----------|--------------|----------------|
+| **A** | Line parallel to the superior sacral surface vs. vertical (scan axis) | ~37° | ↑ in LSTV (median 41.5° vs 37°, P=0.038) |
+| **B** | Line parallel to L3 superior endplate vs. sacral superior surface | — | Non-significant |
+| **C** | Largest angle formed by posterior body lines of TV±1 and S1±1 | ~37° | ↓ in LSTV (P<0.001) |
+| **D** | Sacral superior surface vs. TV (most caudal lumbar) superior surface | ~26° | ↓ in LSTV (P=0.028) |
+| **D1** | TV superior surface vs. TV-1 (supra-adjacent) superior surface | ~14° | ↓ in Type 2 (P<0.001) |
+| **δ (delta)** | D − D1 | ~15° | ↓ in LSTV (P=0.003); **≤8.5° → Type 2 LSTV** |
+
+### Diagnostic Thresholds (from ROC analysis, n=220)
+
+| Criterion | Threshold | Sensitivity | Specificity | NPV | Target |
+|-----------|-----------|-------------|-------------|-----|--------|
+| **δ ≤ 8.5°** | 8.5° | **92.3%** | **87.9%** | **99.5%** | Type 2 LSTV |
+| C ≤ 35.5° | 35.5° | 72.2% | 57.6% | 91.4% | Any LSTV |
+| δ ≤ 14.5° | 14.5° | 66.7% | 52.2% | 88.9% | Any LSTV |
+
+The **δ-angle (delta)** is the most powerful single predictor. A value ≤ 8.5° indicates that at least two levels contribute to the lumbosacral curvature rather than a single, isolated acute angle at L5-S1 — the geometric signature of Type 2 LSTV (pseudo-articular fusion distributing the angulation across multiple levels).
+
+### Clinical Interpretation of the Delta Angle
+
+- **High delta (>15°)**: Concentrated acute angulation at a single L5-S1 junction — normal anatomy, or Type 3 sacralization (where L5 is so incorporated that the spine *appears* normal)
+- **Low delta (≤8.5°)**: Distributed angulation across two levels, implying that the TV participates in both the L4-TV and TV-S1 transitions — Type 2 LSTV with high diagnostic certainty
+- **Important caveat**: Type 3B sacralization with complete fusion may produce normal-appearing angles (the fused L5 is miscounted as S1), which is why the pipeline combines angle analysis with Castellvi TP detection and disc metrics
+
+### Multivariate Independent Predictors (Seilanian Toosi 2025, Table 4)
+
+From logistic regression on 220 subjects:
+
+| Variable | Odds Ratio | 95% CI | P |
+|----------|-----------|--------|---|
+| Increased A-angle | 1.141 | 1.019–1.279 | 0.023 |
+| Decreased D-angle | 0.719 | 0.530–0.976 | 0.034 |
+| L4-L5 disc dehydration | 0.157 | 0.057–0.430 | <0.001 |
+| Non-dehydrated L5-S1 disc | 19.869 | 5.743–68.741 | <0.001 |
+
+The disc dehydration pattern (L4-L5 dehydrated + L5-S1 preserved) has an OR of 19.87 for LSTV and is incorporated as a dedicated criterion in the Bayesian model.
+
+### Implementation
+
+Angles are computed in `lstv_angles.py` via midsagittal 2D OLS line fitting with one-pass outlier rejection. Sagittal slices are extracted as max-projections of a midline slab (±10mm ML). The Bayesian model in `lstv_engine.py` applies log-odds updates from angle findings:
+
+```python
+# LR values from Seilanian Toosi 2025
+delta ≤ 8.5°    →  LR+ ≈ 7.7  (log update: +2.04 nats)
+C ≤ 35.5°       →  LR+ ≈ 4.5  (log update: +1.50 nats)
+A > 41°         →  LR+ ≈ 2.0  (log update: +0.69 nats)
+```
+
+---
+
 ## Radiologic Criteria Implemented
 
 ### Primary Criteria (each independently sufficient to flag LSTV)
@@ -63,6 +122,7 @@ The Castellvi system (Castellvi et al., *Spine* 1984;9(1):31–35) classifies TP
 | **Disc below TV absent / severely reduced** | DHI < 50% | Seyfert 1997; Farfan et al. 1972 |
 | **6-lumbar count** (L6 present) | VERIDAH label 25 detected | Hughes & Saifuddin 2006 |
 | **4-lumbar count** (confirmed both sources) | TSS + VERIDAH = 4 | Konin & Walz 2010 |
+| **δ-angle ≤ 8.5°** | Seilanian Toosi threshold | Seilanian Toosi et al. 2025 |
 
 ### Supporting Criteria (increase phenotype confidence)
 
@@ -74,7 +134,10 @@ The Castellvi system (Castellvi et al., *Spine* 1984;9(1):31–35) classifies TP
 | **TV/L4 normalised H:AP ratio** | < 0.80 → squarer than L4 | Nardo et al. 2012 |
 | **Disc below TV moderately reduced** | DHI 50–70% | Farfan et al. 1972 |
 | **Disc below TV preserved** | DHI ≥ 80% | Konin & Walz 2010 |
-| **Disc above TV preserved** | DHI ≥ 80% | localises pathology to L5-S1 |
+| **Disc above TV preserved** | DHI ≥ 80% | Localises pathology to L5-S1 |
+| **C-angle ≤ 35.5°** | Seilanian Toosi threshold | Seilanian Toosi et al. 2025 |
+| **A-angle > 41°** | Seilanian Toosi threshold | Seilanian Toosi et al. 2025 |
+| **Disc pattern: L4-L5 dehydrated + L5-S1 preserved** | OR 19.87 | Seilanian Toosi et al. 2025 |
 
 ### Disc Height Index (DHI) — Farfan Method
 
@@ -120,15 +183,18 @@ Input: DICOM studies (Sagittal T2w ± Axial T2w)
 │
 ├── Step 03c: Registration (SPINEPS → axial T2w space)
 │
-├── Step 04: LSTV Detection + Morphometrics               [CPU]
+├── Step 04: LSTV Detection + Morphometrics + Angle Analysis  [CPU]
 │   ├── Phase 1: Sagittal geometric Castellvi (TP height, TP–sacrum distance)
 │   ├── Phase 2: Axial T2w signal classification (Type II vs III)
+│   ├── Step 8.5: Vertebral angle analysis (lstv_angles.py)
+│   │   └── A, B, C, D, D1, δ angles — Seilanian Toosi 2025
 │   ├── Phenotype: Radiologically-grounded multi-criteria classifier
 │   │   (independent of Castellvi — both co-reported)
 │   └── Outputs: lstv_results.json  lstv_summary.json
 │
 └── Step 06: 3D Visualisation                             [CPU]
     └── results/lstv_3d/{study_id}_lstv_3d.html
+        └── Paper-accurate dorsal angle overlays (v5.2+)
 ```
 
 ### Critical label disambiguation
@@ -141,6 +207,27 @@ Input: DICOM studies (Sagittal T2w ± Axial T2w)
 | 50 | Not used | **Sacrum** ← preferred sacrum source |
 
 The pipeline always sources TPs from SPINEPS `seg-spine_msk` (labels 43/44) and sacrum from TSS label 50. Mixing these would produce grossly incorrect Castellvi classifications.
+
+---
+
+## Version History
+
+### v5.3 (current)
+- **BUG FIX**: All vertebral angle key names corrected throughout `04_detect_lstv.py`. v5.2 read wrong keys from the `vertebral_angles` dict (e.g. `delta_angle`, `delta_le8p5`, `c_le35p5`) — these do not exist in `VertebralAngles`. Correct names: `delta_angle_deg`, `delta_positive`, `c_positive`, `a_angle_elevated`, `disc_pattern_l4dehy_l5preserved`. This caused all angle-based LSTV detection and logging to silently produce N/A values.
+- **BUG FIX**: TP concordance result now correctly passed to `lstv_engine` via `tp_concordance_precomputed=`, preventing the engine from re-running its broken cross-NIfTI-space comparison.
+
+### v5.2
+- Paper-accurate dorsal angle overlays in `06_visualize_3d.py` matching Seilanian Toosi 2025 Figures 1–4
+- Fixed arc slerp calculation (correct spherical linear interpolation)
+- Color conflict fix: TP-Left = `#00ccff` (cyan), TP-Right = `#ff6600` (orange)
+
+### v5.1
+- TP disc-boundary concordance validation (`tp_in_correct_zone`)
+- Disc dehydration asymmetry pattern in Bayesian model (OR 19.87)
+
+### v5.0
+- Initial vertebral angle analysis integration (Seilanian Toosi 2025)
+- All five angles (A, B, C, D, δ) computed from segmentation masks
 
 ---
 
@@ -159,6 +246,7 @@ TSS labels 41–45 provide L1–L5 counts. VERIDAH label 25 provides L6 detectio
 For each side (left/right), isolate the SPINEPS costal process (TP) label at the TV z-extent ± 3 voxels. Measure:
 1. **TP craniocaudal height** = (z_max − z_min + 1) × voxel_size_z mm (global mask extent)
 2. **TP–sacrum 3D minimum distance** using EDT (scipy.ndimage.distance_transform_edt)
+3. **TP zone validation** via `tp_in_correct_zone()` — confirms TP centroid lies between the inferior face of the L4-L5 disc (TSS 95) and the superior face of the L5-S1 disc (TSS 100) / sacrum
 
 Classification:
 - dist > 2 mm AND height ≥ 19 mm → **Type I**
@@ -173,7 +261,7 @@ Extract a 32×32 voxel patch centred at the midpoint between the closest TP and 
 
 ### Step 4: Phenotype classification (independent of Castellvi)
 
-A tiered multi-criteria classifier grounded in the literature above:
+A tiered multi-criteria classifier grounded in the literature above.
 
 **Tier 1 — Count anomaly (highest specificity, immediate classification)**
 - count = 6 → lumbarization (high confidence)
@@ -192,15 +280,23 @@ Lumbarization pathway requires ≥ 1 primary criterion:
 - L2: disc below TV preserved (DHI ≥ 80%) indicating mobile L6-S1
 - L3: TV body lumbar-like (H/AP ≥ 0.68) with count = 6
 
-Castellvi alone without disc or morphometric corroboration → **transitional_indeterminate** (Castellvi I has lowest clinical impact; Quinlan et al. 1984).
+### Step 8.5: Vertebral angle analysis (Seilanian Toosi 2025)
 
-### What triggers lstv_detected = True
+Computed by `lstv_angles.py` via midsagittal OLS line fitting. Bayesian log-odds updates applied when angle criteria are met. Detection triggers:
+- **δ ≤ 8.5°** → `lstv_detected = True` + reason logged with sens/spec/NPV
+- **C ≤ 35.5° + corroborating finding** (disc pattern, elevated A, or decreased D) → `lstv_detected = True`
+- **Disc pattern alone** (L4-L5 dehydrated + L5-S1 preserved, without Castellvi) → `lstv_detected = True`
+
+### What triggers `lstv_detected = True`
 
 ```
 lstv_detected = True  iff ANY of:
   • Castellvi Type I-IV on either side
   • lumbar_count ≠ 5  (confirmed by reconciled TSS + VERIDAH)
   • phenotype ∈ {sacralization, lumbarization}  (primary criterion confirmed)
+  • δ-angle ≤ 8.5°
+  • C-angle ≤ 35.5° + corroborating angle/disc finding
+  • Disc asymmetry pattern (L4-L5 dehydrated + L5-S1 preserved)
 ```
 
 ---
@@ -210,9 +306,10 @@ lstv_detected = True  iff ANY of:
 ```
 lstv-detector/
 ├── scripts/
+│   ├── lstv_angles.py         ← vertebral angle computation (Seilanian Toosi 2025)
 │   ├── lstv_engine.py         ← all morphometric calculations (importable)
-│   ├── 04_detect_lstv.py      ← Castellvi classifier + phenotype engine
-│   └── 06_visualize_3d.py     ← interactive 3D HTML renderer
+│   ├── 04_detect_lstv.py      ← Castellvi classifier + phenotype + angle engine
+│   └── 06_visualize_3d.py     ← interactive 3D HTML renderer with angle overlays
 │
 ├── slurm_scripts/
 │   ├── 01_dicom_to_nifti.sh
@@ -232,7 +329,7 @@ lstv-detector/
     │   └── {id}_spineps_reg.nii.gz
     ├── lstv_detection/
     │   ├── lstv_results.json      ← per-study full results
-    │   └── lstv_summary.json      ← aggregate statistics
+    │   └── lstv_summary.json      ← aggregate statistics + angle stats
     └── lstv_3d/
         └── {study_id}_lstv_3d.html
 ```
@@ -248,49 +345,53 @@ lstv-detector/
   "study_id": "1307819508",
   "lstv_detected": true,
   "lstv_reason": [
-    "Lumbar count = 6 (expected 5) — LUMBARIZATION by vertebral counting",
-    "Phenotype: LUMBARIZATION (high confidence) — criteria: L1:6-lumbar-count; L3:TV-is-L6"
+    "Angle: delta=6.2 <= 8.5 -- predicts Castellvi Type 2 LSTV (sens 92.3%, spec 87.9%, NPV 99.5%; Seilanian Toosi 2025)",
+    "Phenotype: SACRALIZATION (high confidence) -- criteria: S1:Castellvi-Type-IIb; S2:disc-below-DHI-38pct"
   ],
   "castellvi_type": "Type IIb",
-  "confidence": "high",
-  "left":  { "classification": "Type II", "tp_height_mm": 22.4, "dist_mm": 0.8, ... },
-  "right": { "classification": "Type II", "tp_height_mm": 21.9, "dist_mm": 1.1, ... },
   "lstv_morphometrics": {
-    "lumbar_count_tss": 5,
-    "lumbar_count_veridah": 6,
-    "lumbar_count_consensus": 6,
-    "lumbar_count_anomaly": true,
-    "tv_name": "L6",
-    "has_l6": true,
-    "tv_shape": {
-      "h_ap_ratio": 0.74,
-      "shape_class": "lumbar-like",
-      "norm_ratio": 0.95
-    },
-    "disc_below": {
-      "level": "L6-S1",
-      "dhi_pct": 88.2,
-      "grade": "Normal"
-    },
-    "lstv_phenotype": "lumbarization",
+    "lumbar_count_consensus": 5,
+    "tv_name": "L5",
+    "disc_below": { "level": "L5-S1", "dhi_pct": 38.2, "grade": "Severely reduced" },
+    "lstv_phenotype": "sacralization",
     "phenotype_confidence": "high",
-    "primary_criteria_met": ["L1:6-lumbar-count", "L2:disc-below-preserved-DHI-88pct", "L3:TV-is-L6"]
+    "vertebral_angles": {
+      "angles_available": true,
+      "a_angle_deg": 43.1,
+      "b_angle_deg": 47.3,
+      "c_angle_deg": 28.4,
+      "d_angle_deg": 20.1,
+      "d1_angle_deg": 13.9,
+      "delta_angle_deg": 6.2,
+      "delta_positive": true,
+      "c_positive": true,
+      "a_angle_elevated": true,
+      "angle_flags": { "A": "OK", "C": "OK", "D": "OK", "delta": "OK" }
+    },
+    "probabilities": {
+      "p_sacralization": 0.9312,
+      "p_lumbarization": 0.0041,
+      "p_normal": 0.0647
+    }
   },
-  "pathology_score": 11.0
+  "pathology_score": 14.5
 }
 ```
 
-Note that in this example, `castellvi_type = "Type IIb"` and `lstv_phenotype = "lumbarization"` are **both set**. The TP of L6 forms pseudo-articulations with the sacrum bilaterally (Castellvi IIb) while the overall pattern is lumbarization. These are orthogonal findings and co-reported.
-
-### `lstv_summary.json`
+### `lstv_summary.json` — batch statistics
 
 ```json
 {
   "total": 283,
   "lstv_detected": 61,
   "lstv_rate": 0.2156,
-  "castellvi_breakdown": { "Type Ia": 8, "Type Ib": 4, "Type IIa": 12, ... },
-  "phenotype_breakdown": { "lumbarization": 14, "sacralization": 28, "transitional_indeterminate": 7, "normal": 234 }
+  "angle_stats": {
+    "delta_le8p5_count": 22,
+    "c_le35p5_count": 31,
+    "disc_pattern_count": 18,
+    "angle_only_lstv": 5,
+    "reference": "Seilanian Toosi F et al. Arch Bone Jt Surg. 2025;13(5):271-280"
+  }
 }
 ```
 
@@ -321,25 +422,11 @@ python scripts/04_detect_lstv.py \
     --output_dir     results/lstv_detection
 
 python scripts/06_visualize_3d.py \
-    --study_id 1307819508 \
-    --spineps_dir    results/spineps \
-    --totalspine_dir results/totalspineseg \
-    --output_dir     results/lstv_3d \
-    --lstv_json      results/lstv_detection/lstv_results.json
-```
-
-### Batch — all studies, render top 5 pathologic + 2 normal
-
-```bash
-sbatch slurm_scripts/04_lstv_detection.sh   # ALL=true
-
-# After completion:
-python scripts/06_visualize_3d.py \
-    --rank_by lstv --top_n 5 --top_normal 2 \
-    --lstv_json results/lstv_detection/lstv_results.json \
-    --spineps_dir results/spineps \
-    --totalspine_dir results/totalspineseg \
-    --output_dir results/lstv_3d
+    --study-id 1307819508 \
+    --spineps-dir    results/spineps \
+    --totalspine-dir results/totalspineseg \
+    --output-dir     results/lstv_3d \
+    --lstv-json      results/lstv_detection/lstv_results.json
 ```
 
 ---
@@ -349,21 +436,24 @@ python scripts/06_visualize_3d.py \
 ```python
 from lstv_engine import (
     load_lstv_masks, analyze_lstv, compute_lstv_pathology_score,
-    TP_HEIGHT_MM, TV_SHAPE_LUMBAR, DHI_REDUCED_PCT,
 )
+from lstv_angles import compute_angles_from_spineps
 
 # Load and resample masks to 1mm isotropic
 masks = load_lstv_masks("1307819508", spineps_dir, totalspine_dir)
 
-# Run full morphometric analysis; pass Castellvi result if already computed
+# Run full morphometric + angle analysis
 morpho = analyze_lstv(masks, castellvi_result=detect_result)
 
 print(f"TV:         {morpho.tv_name}")
-print(f"Count:      {morpho.lumbar_count_consensus}")
 print(f"Phenotype:  {morpho.lstv_phenotype} ({morpho.phenotype_confidence})")
-print(f"Primary:    {morpho.primary_criteria_met}")
-print(f"DHI below:  {morpho.disc_below.dhi_pct:.1f}%")
-print(f"H/AP ratio: {morpho.tv_shape.h_ap_ratio:.2f} ({morpho.tv_shape.shape_class})")
+print(f"P(sac):     {morpho.probabilities.p_sacralization:.1%}")
+
+va = morpho.vertebral_angles
+if va and va.angles_available:
+    print(f"δ-angle:    {va.delta_angle_deg:.1f}°  ({'⚠ TYPE 2' if va.delta_positive else 'normal'})")
+    print(f"C-angle:    {va.c_angle_deg:.1f}°  ({'⚠ LSTV' if va.c_positive else 'normal'})")
+    print(f"A-angle:    {va.a_angle_deg:.1f}°  ({'↑ elevated' if va.a_angle_elevated else 'normal'})")
 
 # Pathology burden score for ranking
 score = compute_lstv_pathology_score(detect_result, morpho.to_dict())
@@ -377,16 +467,18 @@ Each HTML output (`{study_id}_lstv_3d.html`) contains:
 
 - **Colour-coded phenotype banner**: SACRALIZATION (red) / LUMBARIZATION (orange) / TRANSITIONAL (yellow) / NORMAL (green)
 - **Castellvi badge**: displayed alongside phenotype — both shown simultaneously if applicable
-- **TP height rulers**: craniocaudal extent overlaid on 3D TP mesh (red/cyan = left/right; diamond marker with ≥19mm flag)
+- **TP concordance badge**: L/R status showing whether TPs are validated within the L4-L5 / L5-S1 disc bounds
+- **TP height rulers**: craniocaudal extent overlaid on 3D TP mesh (≥19mm flag)
 - **TP–sacrum gap rulers**: dashed line to nearest sacrum point; contact (≤2mm) shown in red
-- **TV body shape annotation**: SI-height and AP-depth rulers; H/AP ratio labelled with literature classification
-- **Lumbar count badge**: `4`, `5`, or `6` with anomaly flag
-- **LSTV detection reasons panel**: full list of which criteria triggered lstv_detected
-- **Phenotype rationale panel**: multi-sentence radiologic justification with primary criteria
-- **Disc DHI strip**: above/below TV DHI percentages colour-coded by grade
-- **Camera presets**: Oblique / Lateral / Posterior / Anterior / Axial
-
-The visualiser ranks studies by pathology score (configurable via `--top_n`, `--top_normal`). "Normal" controls are strictly defined: lstv_detected=False AND count=5 AND score=0.
+- **Paper-accurate dorsal angle overlays** (v5.2+): all six angles rendered at distinct dorsal depths matching Seilanian Toosi 2025 Figures 1–4
+  - δ (white/red, furthest dorsal, thickest lines) — turns red and appends "⚠ Type2 LSTV" if ≤8.5°
+  - D (orange) / D1 (cyan) — intermediate dorsal depths
+  - C (magenta) — posterior body lines with yellow vertical reference
+  - A (yellow) / B (red) — near-spine placement
+  - Each overlay: tilted endplate line, dashed vertical connector, slerp arc, bold label
+- **Angle panel sidebar**: all six angle values with colour-coded threshold badges (red = threshold exceeded, green = normal)
+- **Probability panel**: P(sacralization) / P(lumbarization) / P(normal) with bar visualizations
+- **Surgical risk panel**: wrong-level risk category, Bertolotti probability, surgical flags
 
 ---
 
@@ -409,6 +501,74 @@ Used for study ranking only — not a diagnosis. Higher = more interesting LSTV 
 | TV body sacral-like (H/AP < 0.52) | +2 |
 | TV body transitional (H/AP 0.52–0.68) | +1 |
 | Rib anomaly (lumbar rib / thoracic count mismatch) | +1 |
+| **δ-angle ≤ 8.5° (Type 2 predictor)** | **+3** |
+| **δ-angle ≤ 15° (borderline)** | **+1.5** |
+| **C-angle ≤ 35.5°** | **+1.5** |
+| **A-angle > 41° (elevated sacral tilt)** | **+0.5** |
+
+---
+
+## Known Limitations
+
+**Lumbarization count edge case**: TSS labels stop at L5 (label 45). When L6 is present, TSS will label L1–L5 of the 6-lumbar spine correctly, but the TSS count will read as 5 (normal). The L6 signal comes exclusively from VERIDAH label 25. If SPINEPS mis-labels L6 (e.g., as a second L5), the consensus count will be 5 and the L6 will be missed. The cross-validation warning (`L5 centroid dist > 20mm`) will flag such cases.
+
+**Type III over-reporting**: Phase 2 MRI Type III classification is provisional. Homogeneous T2 signal at the TP junction may occur with periosteal bone marrow without true cortical bridging. CT confirmation is recommended before operative planning.
+
+**Castellvi on 4-lumbar spines**: When count=4, the lowest mobile segment is typically L4. The VERIDAH TV search will identify L4 (label 23) as the TV, and Castellvi will be assessed on L4 TP. This is radiologically correct — the sacralizing segment's TP should be evaluated — but the label printed will be "L4."
+
+**DHI at L6-S1**: TotalSpineSeg has no disc label for the L6-S1 level. DHI at L6-S1 uses VERIDAH IVD label 125 (100 + VD_L6=25) if present. If SPINEPS does not label the L6-S1 disc, DHI will be reported as undetected (not absent).
+
+**Type 3B angle limitation**: Seilanian Toosi 2025 specifically notes that Type 3B sacralization with complete fusion can produce apparently normal angles because L5 is so incorporated that the MRI appears to have normal lumbar anatomy — the "L5" is simply miscounted as S1. The delta angle was documented to be ineffective in these cases. The pipeline's Castellvi + disc + count criteria remain the primary detection pathway for Type 3.
+
+**Angle coordinate space**: All five angles are computed on a reconstructed midsagittal 2D slice from the 3D segmentation via maximum-intensity projection. Rotation of the patient relative to the scanner (e.g., scoliosis >10°) can bias the midline projection and should be interpreted with caution. The `_identify_axes()` function in `lstv_angles.py` automatically detects the CC/AP/ML axes, which partially mitigates this.
+
+---
+
+## Future Directions
+
+### 1. Head-to-Head Comparison with Competing Angle Metrics
+
+The Seilanian Toosi paper situates the δ- and C-angles against a field of competing quantitative approaches that the pipeline does not yet implement. A natural extension is a direct comparative validation study on the pipeline's output:
+
+- **Chalian et al. 2012 A/B angles** (*World J Radiol*): The original sagittal angle proposal (sensitivity/specificity 80% as reported by Chalian). Seilanian Toosi found the A-angle to remain a significant independent predictor (OR 1.141) but insufficient alone. Direct pipeline comparison would test whether the A/B angles add marginal information beyond δ in a segmentation-derived framework.
+- **Farshad Diff-VMVA** (*Bone Joint J* 2013): Draws four vertical midvertebral lines from the last fully-developed disc cranially, computes the difference between the two most caudal inter-line angles. Diff-VMVA ≤ 10° reportedly identifies Type 3/4 LSTV with 100% sensitivity and 89% specificity on symptomatic patients — the complementary regime to δ (which is strong for Type 2 but weak for Type 3). Implementing Diff-VMVA would allow the pipeline to cover both ends of the fusion spectrum.
+- **AVA (Anterior-edge Vertebral Angle) — Zhou et al. 2022** (*Eur Radiol*): Quantitative PET/CT-derived metric with sensitivity 77.5% and specificity 88.3% at a cutoff of 73°. While CT-based, the anterior endplate angle is measurable on sagittal MRI and may be extractable from TotalSpineSeg endplate labels. Comparison against δ and C on the same cohort would establish which angle provides greatest diagnostic yield on MRI specifically.
+- **RISE (Ratio of Inferior-to-Superior Endplate Length)**: Another PET/CT parameter introduced for LSTV enumeration; not yet validated on MRI segmentation data.
+
+### 2. Axial MRI Nerve Root Morphology for Level Counting
+
+A highly promising but unimplemented approach uses axial T2-weighted MRI at the sacral level to determine the presacral vertebral count directly from nerve root caliber, without requiring whole-spine imaging (described on Radiopaedia, sourced from clinical practice guidelines):
+
+The method exploits the fact that the L5 nerve characteristically does not split proximally and has approximately twice the caliber of the L4 peroneal branch at this level. The pattern at the lateral sacrum determines the count:
+
+- **4 lumbar segments** (completely sacralized L5, 23 presacral vertebrae): a bundle of several splitting nerves at the lateral sacrum represents the L4 nerve
+- **5 lumbar segments** (normal anatomy, or partial sacralization/lumbarization, 24 presacral vertebrae): a thin nerve joining a thicker nerve at the lateral sacrum represents the peroneal branch of L4 and the L5 nerve
+- **6 lumbar segments** (completely lumbarized S1, 25 presacral vertebrae): two nerves of similar caliber at the lateral sacrum represent the L5 and S1 nerves
+
+**Implementation pathway**: The pipeline already registers SPINEPS into the axial T2w space (Step 03c). SPINEPS labels the spinal cord (label 60) and canal (label 61) but does not currently segment individual nerve roots. Integration options include:
+  - Fine-tuning SPINEPS with a nerve-root segmentation head on axial slices at the L5-S1 level
+  - Using a separate dedicated nerve root segmentation model (e.g., based on nnU-Net trained on sacral axial slices) and registering output into the pipeline's shared coordinate space
+  - Semi-automated measurement: extracting the L5-S1 axial slice from the registered data and computing cross-sectional area of the two lateral nerve bundles; a caliber ratio > 1.8 would indicate the 5-lumbar pattern
+
+This modality is orthogonal to all sagittal-slice methods and could serve as a strong independent confirmatory criterion — particularly for cases where the sagittal angle analysis is confounded by scoliosis or Type 3 fusion, or where the whole-spine localizer is unavailable.
+
+### 3. Iliolumbar Ligament Landmark Integration
+
+The iliolumbar ligament (ILL) typically arises from the transverse process of L5 and has been proposed as a landmark for vertebral numbering. Its utility is mixed: Farshad-Amacker et al. found it unreliable in LSTV cases (multiple origins), and the Seilanian Toosi cohort did not use it. However:
+- In cases where SPINEPS labels the iliolumbar ligament or the ILL is visible on axial MRI, cross-referencing its origin with the VERIDAH TV identification could provide a soft Bayesian prior
+- The ILL appears to reliably originate from the **last mobile** lumbar vertebra even in LSTV — making it a marker of TV identity rather than absolute count
+
+### 4. Multi-Center Angle Validation
+
+Seilanian Toosi 2025 explicitly calls for multi-center validation in larger populations. The pipeline's automated angle extraction provides a direct vehicle for this: running the pipeline on a held-out multi-center cohort (e.g., from the DRYAD spine imaging repositories or the SPIDER dataset) and comparing automatically computed angles against radiologist ground truth would establish inter-site reproducibility of the δ-angle threshold.
+
+### 5. Clinical Outcome Correlation
+
+The paper recommends correlating vertebral angle measurements with clinical findings (symptoms, pain scores, functional outcomes). The pipeline's surgical relevance module already outputs Bertolotti syndrome probability and wrong-level risk scores. Linking these to postoperative outcomes data from an institutional spine surgery registry would enable prospective validation of the surgical risk model.
+
+### 6. Longitudinal Angle Tracking
+
+The δ-angle has a mechanistic interpretation — it reflects the degree to which the TV participates in the lumbosacral curvature. Serial imaging in patients with Bertolotti syndrome could test whether progressive sacralization correlates with δ-angle decrease over time, providing a quantitative imaging biomarker of transition progression.
 
 ---
 
@@ -433,18 +593,6 @@ Used for study ranking only — not a diagnosis. Higher = more interesting LSTV 
 ### Resumability
 
 Each step tracks progress in `progress_selective.json`. Resubmitting any SLURM script automatically skips completed studies.
-
----
-
-## Known Limitations
-
-**Lumbarization count edge case**: TSS labels stop at L5 (label 45). When L6 is present, TSS will label L1–L5 of the 6-lumbar spine correctly, but the TSS count will read as 5 (normal). The L6 signal comes exclusively from VERIDAH label 25. If SPINEPS mis-labels L6 (e.g., as a second L5), the consensus count will be 5 and the L6 will be missed. The cross-validation warning (`L5 centroid dist > 20mm`) will flag such cases.
-
-**Type III over-reporting**: Phase 2 MRI Type III classification is provisional. Homogeneous T2 signal at the TP junction may occur with periosteal bone marrow without true cortical bridging. CT confirmation is recommended before operative planning.
-
-**Castellvi on 4-lumbar spines**: When count=4, the lowest mobile segment is typically L4. The VERIDAH TV search will identify L4 (label 23) as the TV, and Castellvi will be assessed on L4 TP. This is radiologically correct — the sacralizing segment's TP should be evaluated — but the label printed will be "L4."
-
-**DHI at L6-S1**: TotalSpineSeg has no disc label for the L6-S1 level. DHI at L6-S1 uses VERIDAH IVD label 125 (100 + VD_L6=25) if present. If SPINEPS does not label the L6-S1 disc, DHI will be reported as undetected (not absent).
 
 ---
 
@@ -476,9 +624,19 @@ All thresholds are sourced directly from peer-reviewed literature. No arbitrary 
 
 12. **Nidecker AE**, Woernle CM, Sprott H. *Sacral transitional vertebra and L5 sacralization: considerations for lumbar spine surgery*. Eur Radiol. 2018;28(4):1376–1383. — MRI Phase 2 T2w signal classification criteria; surgical implications.
 
-13. **Möller H** et al. *SPINEPS — automatic whole spine segmentation of T2-weighted MR images using a two-step approach for iterative segmentation of individual spine structures*. Eur Radiol. 2025. doi:10.1007/s00330-024-11155-y
+13. **Seilanian Toosi F**, Mahdianfar B, Zarifian A, et al. *Lumbosacral vertebral angles can predict lumbosacral transitional vertebrae on routine sagittal MRI*. Arch Bone Jt Surg. 2025;13(5):271–280. doi:10.22038/ABJS.2025.83244.3790. — A/B/C/D/δ angles; δ ≤ 8.5° for Type 2 LSTV (sens 92.3%, spec 87.9%, NPV 99.5%); C ≤ 35.5° for any LSTV; disc asymmetry OR 19.87.
 
-14. **Warszawer Y** et al. *TotalSpineSeg: Robust spine segmentation and landmark labeling in MRI*. 2025. arXiv:2411.09344.
+14. **Chalian M**, Soldatos T, Carrino JA, Belzberg AJ, Khanna J, Chhabra A. *Prediction of transitional lumbosacral anatomy on magnetic resonance imaging of the lumbar spine*. World J Radiol. 2012;4(3):97–101. — Original A/B angle proposal; 80% sensitivity/specificity claim.
+
+15. **Farshad M**, Aichmair A, Hughes AP, Herzog RJ, Farshad-Amacker NA. *A reliable measurement for identifying a lumbosacral transitional vertebra with a solid bony bridge on a single-slice midsagittal MRI or plain lateral radiograph*. Bone Joint J. 2013;95-B(11):1533–7. — Diff-VMVA ≤10° for Type 3/4 LSTV; 100% sensitivity, 89% specificity.
+
+16. **Zhou S**, Du L, Liu X, et al. *Quantitative measurements at the lumbosacral junction are more reliable parameters for identifying and numbering lumbosacral transitional vertebrae*. Eur Radiol. 2022;32(8):5650–5658. — AVA (anterior-edge vertebral angle) at cutoff 73°; sensitivity 77.5%, specificity 88.3%.
+
+17. **Farshad-Amacker NA**, Lurie B, Herzog RJ, Farshad M. *Is the iliolumbar ligament a reliable identifier of the L5 vertebra in lumbosacral transitional anomalies?* Eur Radiol. 2014;24(10):2623–30. — ILL unreliable in LSTV; multiple origins.
+
+18. **Möller H** et al. *SPINEPS — automatic whole spine segmentation of T2-weighted MR images using a two-step approach for iterative segmentation of individual spine structures*. Eur Radiol. 2025. doi:10.1007/s00330-024-11155-y
+
+19. **Warszawer Y** et al. *TotalSpineSeg: Robust spine segmentation and landmark labeling in MRI*. 2025. arXiv:2411.09344.
 
 ---
 
