@@ -1244,17 +1244,15 @@ def main() -> int:
                 f"({100*n_classification_changed/max(n_align,1):.1f}%)")
 
     if cohort_stats:
-        logger.info(f"  Mean H0 alignment score:     "
-                    f"{cohort_stats.mean_h0_score:.3f} ± {cohort_stats.std_h0_score:.3f}")
-        logger.info(f"  Mean H1 alignment score:     "
-                    f"{cohort_stats.mean_h1_score:.3f} ± {cohort_stats.std_h1_score:.3f}"
-                    if cohort_stats.mean_h1_score else "  Mean H1 alignment score:     N/A")
+        logger.info(f"  Mean best alignment score:   "
+                    f"{cohort_stats.mean_best_score:.3f} ± {cohort_stats.std_best_score:.3f}"
+                    if cohort_stats.mean_best_score else "  Mean best alignment score:   N/A")
 
     logger.info(f"\n── Alignment Confidence Breakdown ────────────────────────────────")
     if cohort_stats:
-        logger.info(f"  High:          {cohort_stats.n_high_confidence}")
-        logger.info(f"  Moderate:      {cohort_stats.n_moderate_confidence}")
-        logger.info(f"  Low:           {cohort_stats.n_low_confidence}")
+        logger.info(f"  High:          {cohort_stats.n_high}")
+        logger.info(f"  Moderate:      {cohort_stats.n_moderate}")
+        logger.info(f"  Low:           {cohort_stats.n_low}")
         logger.info(f"  Insufficient:  {cohort_stats.n_insufficient}")
 
     logger.info(f"\n── Castellvi Type Breakdown ──────────────────────────────────────")
