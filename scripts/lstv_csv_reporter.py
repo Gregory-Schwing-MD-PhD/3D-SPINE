@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 lstv_csv_reporter.py — LSTV Results → Presentation-Ready CSV
@@ -41,29 +40,47 @@ PER_STUDY_COLUMNS = [
     'phenotype_confidence',
     'pathology_score',
 
-    # ── Alignment analysis ────────────────────────────────────────────────────
-    'alignment_preferred',         # H0_aligned | H1_shifted | insufficient_data
-    'alignment_confidence',        # high | moderate | low | insufficient_data
-    'alignment_score_h0',          # mean Dice under H0 (TSS=ground truth)
-    'alignment_score_h1',          # mean Dice under H1 (VERIDAH=ground truth)
-    'alignment_score_margin',      # score_h1 - score_h0 (+ve = H1 better)
-    'alignment_consistency_h1',    # fraction of pairs where H1 > H0
-    'vd_l6_present',               # VERIDAH found an L6 label
+    # ── Alignment analysis (generalised offset model) ───────────────────────
+    'alignment_preferred',         # aligned | shifted_plus_1 | shifted_minus_1 | ...
+    'alignment_confidence',        # high | moderate | low | ambiguous | insufficient_data
+    'alignment_best_offset',       # integer: 0=aligned, +1=lumbarization, -1=sacralization
+    'alignment_best_score',        # mean Dice at accepted offset
+    'alignment_second_best_score', # mean Dice at runner-up offset
+    'alignment_score_margin',      # best - second_best (+ve = clear winner)
+    'alignment_consistency_frac',  # fraction of individual pairs favouring best offset
+    'alignment_consistency_beats', # numerator: pairs where best > zero
+    'alignment_consistency_total', # denominator: comparable pairs
+    'tss_lumbar_count',            # number of TSS lumbar labels present
+    'vd_lumbar_count',             # number of VERIDAH lumbar labels present
+    'vd_l6_present',               # VERIDAH found a label 25 (L6)
 
-    # ── Per-level H0 Dice (alignment quality under null hypothesis) ───────────
-    'h0_dice_L1', 'h0_dice_L2', 'h0_dice_L3', 'h0_dice_L4', 'h0_dice_L5',
+    # ── Per-offset Dice scores (offset -2 .. +2) ──────────────────────────────
+    'dice_offset_minus2',
+    'dice_offset_minus1',
+    'dice_offset_0',
+    'dice_offset_plus1',
+    'dice_offset_plus2',
 
-    # ── Per-level H1 Dice (alignment quality under shift hypothesis) ──────────
-    'h1_dice_L1', 'h1_dice_L2', 'h1_dice_L3', 'h1_dice_L4', 'h1_dice_L5toL6',
+    # ── Per-level Dice at offset=0 (alignment quality at null hypothesis) ─────
+    'dice0_L1', 'dice0_L2', 'dice0_L3', 'dice0_L4', 'dice0_L5',
 
-    # ── Classification under each hypothesis ──────────────────────────────────
-    'castellvi_h0',
-    'castellvi_h1',
-    'phenotype_h0',
-    'phenotype_h1',
-    'lstv_detected_h0',
-    'lstv_detected_h1',
-    'classification_changes_with_alignment',   # True if H0≠H1 classification
+    # ── Per-level Dice at best offset ─────────────────────────────────────────
+    'best_dice_L1', 'best_dice_L2', 'best_dice_L3', 'best_dice_L4', 'best_dice_L5',
+
+    # ── Classification at offset=0 (TSS-guided TV = primary) ──────────────────
+    'castellvi_at_zero',       # Castellvi using TSS L5 as TV
+    'phenotype_at_zero',       # LSTV phenotype using TSS L5 as TV
+    'lstv_detected_at_zero',
+
+    # ── Classification at best offset (alternative TV) ────────────────────────
+    'castellvi_at_best',       # Castellvi using offset-guided TV
+    'tv_at_best',              # which VD label was used as TV for at_best
+    'phenotype_at_best',       # LSTV phenotype using offset-guided TV
+    'lstv_detected_at_best',
+
+    # ── Disagreement flag ─────────────────────────────────────────────────────
+    'castellvi_disagrees',     # True when at_zero != at_best (and both not None)
+    'phenotype_disagrees',
 
     # ── Morphometrics ─────────────────────────────────────────────────────────
     'lumbar_count_tss',
@@ -117,22 +134,34 @@ PER_STUDY_COLUMNS = [
 
 ALIGNMENT_COLUMNS = [
     'study_id',
+    'tss_lumbar_count',
+    'vd_lumbar_count',
     'vd_l6_present',
     'alignment_preferred',
     'alignment_confidence',
-    'alignment_score_h0',
-    'alignment_score_h1',
+    'alignment_best_offset',
+    'alignment_best_score',
+    'alignment_second_best_score',
     'alignment_score_margin',
-    'alignment_consistency_h1',
-    'h0_dice_L1', 'h0_dice_L2', 'h0_dice_L3', 'h0_dice_L4', 'h0_dice_L5',
-    'h1_dice_L1', 'h1_dice_L2', 'h1_dice_L3', 'h1_dice_L4', 'h1_dice_L5toL6',
+    'alignment_consistency_frac',
+    'alignment_consistency_beats',
+    'alignment_consistency_total',
+    'dice_offset_minus2',
+    'dice_offset_minus1',
+    'dice_offset_0',
+    'dice_offset_plus1',
+    'dice_offset_plus2',
+    'dice0_L1', 'dice0_L2', 'dice0_L3', 'dice0_L4', 'dice0_L5',
+    'best_dice_L1', 'best_dice_L2', 'best_dice_L3', 'best_dice_L4', 'best_dice_L5',
     'tss_labels_present',
     'vd_labels_present',
-    'castellvi_h0',
-    'castellvi_h1',
-    'phenotype_h0',
-    'phenotype_h1',
-    'classification_changes_with_alignment',
+    'castellvi_at_zero',
+    'castellvi_at_best',
+    'tv_at_best',
+    'phenotype_at_zero',
+    'phenotype_at_best',
+    'castellvi_disagrees',
+    'phenotype_disagrees',
     'ground_truth_label',
     'ground_truth_method',
     'alignment_summary',
@@ -191,36 +220,73 @@ def _flatten_study(
 
     # ── Alignment ──────────────────────────────────────────────────────────────
     if ar is not None:
-        row['alignment_preferred']      = ar.preferred_hypothesis
-        row['alignment_confidence']     = ar.confidence
-        row['alignment_score_h0']       = _r(ar.score_h0, 3)
-        row['alignment_score_h1']       = _r(ar.score_h1, 3)
-        row['alignment_score_margin']   = _r(ar.score_margin, 3)
-        row['alignment_consistency_h1'] = _r(ar.consistency_frac_h1, 3)
-        row['vd_l6_present']            = _bool(ar.vd_l6_present)
-        row['alignment_summary']        = ar.summary
+        row['alignment_preferred']         = ar.preferred_hypothesis
+        row['alignment_confidence']        = ar.confidence
+        row['alignment_best_offset']       = (str(ar.best_offset)
+                                               if ar.best_offset is not None else '')
+        row['alignment_best_score']        = _r(ar.best_score, 3)
+        row['alignment_second_best_score'] = _r(ar.second_best_score, 3)
+        row['alignment_score_margin']      = _r(ar.score_margin, 3)
+        row['alignment_consistency_frac']  = _r(ar.consistency_frac, 3)
+        row['alignment_consistency_beats'] = str(ar.consistency_beats)
+        row['alignment_consistency_total'] = str(ar.consistency_total)
+        row['tss_lumbar_count']            = str(ar.tss_count)
+        row['vd_lumbar_count']             = str(ar.vd_count)
+        row['vd_l6_present']               = _bool(25 in ar.vd_labels_present)
+        row['alignment_summary']           = ar.summary
 
-        # Per-level H0 dice
-        h0_cols  = ['h0_dice_L1', 'h0_dice_L2', 'h0_dice_L3', 'h0_dice_L4', 'h0_dice_L5']
-        h0_dice  = _extract_h_dice(ar.h0, h0_cols)
-        row.update(h0_dice)
+        # Per-offset mean Dice scores
+        for k, col in [(-2,'dice_offset_minus2'), (-1,'dice_offset_minus1'),
+                        (0,'dice_offset_0'), (1,'dice_offset_plus1'), (2,'dice_offset_plus2')]:
+            s = ar.offset_scores.get(k)
+            row[col] = _r(s.mean_dice if s else None, 3)
 
-        # Per-level H1 dice
-        h1_cols  = ['h1_dice_L1', 'h1_dice_L2', 'h1_dice_L3', 'h1_dice_L4', 'h1_dice_L5toL6']
-        h1_dice  = _extract_h_dice(ar.h1, h1_cols)
-        row.update(h1_dice)
+        # Per-level Dice at offset=0
+        s0 = ar.offset_scores.get(0)
+        for i, col in enumerate(['dice0_L1','dice0_L2','dice0_L3','dice0_L4','dice0_L5']):
+            d = s0.pairs[i].dice if (s0 and i < len(s0.pairs)) else None
+            row[col] = _r(d, 3)
 
-        # Ensemble downstream classifications
-        row['castellvi_h0']   = str(ar.castellvi_h0 or '')
-        row['castellvi_h1']   = str(ar.castellvi_h1 or '')
-        row['phenotype_h0']   = str(ar.phenotype_h0  or '')
-        row['phenotype_h1']   = str(ar.phenotype_h1  or '')
-        row['lstv_detected_h0'] = _bool(ar.lstv_detected_h0)
-        row['lstv_detected_h1'] = _bool(ar.lstv_detected_h1)
+        # Per-level Dice at best offset
+        sb = ar.offset_scores.get(ar.best_offset) if ar.best_offset is not None else None
+        for i, col in enumerate(['best_dice_L1','best_dice_L2','best_dice_L3',
+                                  'best_dice_L4','best_dice_L5']):
+            d = sb.pairs[i].dice if (sb and i < len(sb.pairs)) else None
+            row[col] = _r(d, 3)
 
-        ct_changed = (ar.castellvi_h0 != ar.castellvi_h1 or
-                      ar.phenotype_h0  != ar.phenotype_h1)
-        row['classification_changes_with_alignment'] = _bool(ct_changed)
+        # Classification at offset=0 (primary / TSS-guided)
+        row['castellvi_at_zero']      = str(ar.castellvi_at_zero  or '')
+        row['phenotype_at_zero']      = str(ar.phenotype_at_zero   or '')
+        row['lstv_detected_at_zero']  = _bool(ar.lstv_detected_at_zero)
+
+        # Classification at best offset (alternative TV)
+        row['castellvi_at_best']      = str(ar.castellvi_at_best  or '')
+        row['phenotype_at_best']      = str(ar.phenotype_at_best   or '')
+        row['lstv_detected_at_best']  = _bool(ar.lstv_detected_at_best)
+
+        # Compute which VD label was used as TV at best offset
+        # (at_zero TV = VD label matching tss_highest_lumbar; at_best = that + offset)
+        if ar.best_offset is not None and ar.best_offset != 0:
+            from vertebral_alignment import VD_LUMBAR_BASE, VD_LUMBAR_MAX
+            VD_NAMES = {20:'L1',21:'L2',22:'L3',23:'L4',24:'L5',25:'L6'}
+            # at_zero VD = highest VD lumbar label at offset=0 that was a valid pair
+            s0_valid = [p for p in (s0.pairs if s0 else []) if p.valid]
+            at_zero_vd = max((p.vd_label for p in s0_valid), default=None)
+            if at_zero_vd is not None:
+                at_best_vd = at_zero_vd + ar.best_offset
+                row['tv_at_best'] = VD_NAMES.get(at_best_vd, f'VD{at_best_vd}')
+            else:
+                row['tv_at_best'] = ''
+        else:
+            row['tv_at_best'] = ''
+
+        # Disagreement flags
+        ct_zero = ar.castellvi_at_zero;  ct_best = ar.castellvi_at_best
+        ph_zero = ar.phenotype_at_zero;  ph_best = ar.phenotype_at_best
+        ct_disagree = (ct_zero != ct_best and None not in (ct_zero, ct_best))
+        ph_disagree = (ph_zero != ph_best and None not in (ph_zero, ph_best))
+        row['castellvi_disagrees'] = _bool(ct_disagree)
+        row['phenotype_disagrees'] = _bool(ph_disagree)
 
         row['ground_truth_label']  = str(ar.ground_truth_label  or '')
         row['ground_truth_method'] = str(ar.ground_truth_method or '')
@@ -288,29 +354,65 @@ def _flatten_alignment_only(ar: AlignmentResult) -> Dict[str, str]:
     row: Dict[str, str] = {col: '' for col in ALIGNMENT_COLUMNS}
 
     row['study_id']                   = ar.study_id
-    row['vd_l6_present']              = _bool(ar.vd_l6_present)
+    row['tss_lumbar_count']           = str(ar.tss_count)
+    row['vd_lumbar_count']            = str(ar.vd_count)
+    row['vd_l6_present']              = _bool(25 in ar.vd_labels_present)
     row['alignment_preferred']        = ar.preferred_hypothesis
     row['alignment_confidence']       = ar.confidence
-    row['alignment_score_h0']         = _r(ar.score_h0,        3)
-    row['alignment_score_h1']         = _r(ar.score_h1,        3)
-    row['alignment_score_margin']     = _r(ar.score_margin,    3)
-    row['alignment_consistency_h1']   = _r(ar.consistency_frac_h1, 3)
+    row['alignment_best_offset']      = (str(ar.best_offset)
+                                         if ar.best_offset is not None else '')
+    row['alignment_best_score']       = _r(ar.best_score, 3)
+    row['alignment_second_best_score']= _r(ar.second_best_score, 3)
+    row['alignment_score_margin']     = _r(ar.score_margin, 3)
+    row['alignment_consistency_frac'] = _r(ar.consistency_frac, 3)
+    row['alignment_consistency_beats']= str(ar.consistency_beats)
+    row['alignment_consistency_total']= str(ar.consistency_total)
     row['tss_labels_present']         = str(ar.tss_labels_present)
     row['vd_labels_present']          = str(ar.vd_labels_present)
-    row['castellvi_h0']               = str(ar.castellvi_h0   or '')
-    row['castellvi_h1']               = str(ar.castellvi_h1   or '')
-    row['phenotype_h0']               = str(ar.phenotype_h0   or '')
-    row['phenotype_h1']               = str(ar.phenotype_h1   or '')
-    row['classification_changes_with_alignment'] = _bool(
-        ar.castellvi_h0 != ar.castellvi_h1 or ar.phenotype_h0 != ar.phenotype_h1)
-    row['ground_truth_label']         = str(ar.ground_truth_label  or '')
-    row['ground_truth_method']        = str(ar.ground_truth_method or '')
-    row['alignment_summary']          = ar.summary
 
-    h0_cols = ['h0_dice_L1','h0_dice_L2','h0_dice_L3','h0_dice_L4','h0_dice_L5']
-    h1_cols = ['h1_dice_L1','h1_dice_L2','h1_dice_L3','h1_dice_L4','h1_dice_L5toL6']
-    row.update(_extract_h_dice(ar.h0, h0_cols))
-    row.update(_extract_h_dice(ar.h1, h1_cols))
+    # Per-offset scores
+    for k, col in [(-2,'dice_offset_minus2'), (-1,'dice_offset_minus1'),
+                    (0,'dice_offset_0'), (1,'dice_offset_plus1'), (2,'dice_offset_plus2')]:
+        s = ar.offset_scores.get(k)
+        row[col] = _r(s.mean_dice if s else None, 3)
+
+    # Per-level Dice at offset=0
+    s0 = ar.offset_scores.get(0)
+    for i, col in enumerate(['dice0_L1','dice0_L2','dice0_L3','dice0_L4','dice0_L5']):
+        d = s0.pairs[i].dice if (s0 and i < len(s0.pairs)) else None
+        row[col] = _r(d, 3)
+
+    # Per-level Dice at best offset
+    sb = ar.offset_scores.get(ar.best_offset) if ar.best_offset is not None else None
+    for i, col in enumerate(['best_dice_L1','best_dice_L2','best_dice_L3',
+                              'best_dice_L4','best_dice_L5']):
+        d = sb.pairs[i].dice if (sb and i < len(sb.pairs)) else None
+        row[col] = _r(d, 3)
+
+    # Ensemble classifications
+    row['castellvi_at_zero']   = str(ar.castellvi_at_zero  or '')
+    row['castellvi_at_best']   = str(ar.castellvi_at_best  or '')
+    row['phenotype_at_zero']   = str(ar.phenotype_at_zero   or '')
+    row['phenotype_at_best']   = str(ar.phenotype_at_best   or '')
+
+    # TV used for at_best classification
+    VD_NAMES = {20:'L1',21:'L2',22:'L3',23:'L4',24:'L5',25:'L6'}
+    if ar.best_offset is not None and ar.best_offset != 0 and s0:
+        s0_valid = [p for p in s0.pairs if p.valid]
+        at_zero_vd = max((p.vd_label for p in s0_valid), default=None)
+        if at_zero_vd is not None:
+            at_best_vd = at_zero_vd + ar.best_offset
+            row['tv_at_best'] = VD_NAMES.get(at_best_vd, f'VD{at_best_vd}')
+
+    ct_zero = ar.castellvi_at_zero; ct_best = ar.castellvi_at_best
+    ph_zero = ar.phenotype_at_zero; ph_best = ar.phenotype_at_best
+    row['castellvi_disagrees'] = _bool(ct_zero != ct_best
+                                        and None not in (ct_zero, ct_best))
+    row['phenotype_disagrees'] = _bool(ph_zero != ph_best
+                                        and None not in (ph_zero, ph_best))
+    row['ground_truth_label']  = str(ar.ground_truth_label  or '')
+    row['ground_truth_method'] = str(ar.ground_truth_method or '')
+    row['alignment_summary']   = ar.summary
 
     return row
 
@@ -371,7 +473,7 @@ def write_csv_reports(
     # ── 4. Alignment subgroup: studies with VD L6 present (most interesting) ──
     l6_studies   = [r for r in results
                     if ar_by_id.get(str(r.get('study_id', ''))) is not None
-                    and ar_by_id[str(r.get('study_id', ''))].vd_l6_present]
+                    and (25 in ar_by_id[str(r.get('study_id', ''))].vd_labels_present)]
     if l6_studies:
         l6_path = output_dir / 'lstv_l6_subgroup.csv'
         with open(l6_path, 'w', newline='', encoding='utf-8') as fh:

@@ -830,29 +830,33 @@ def classify_study(study_id:       str,
         logger.info(f"  ✗ [{study_id}] No Castellvi (H0)")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # ENSEMBLE H1 CLASSIFICATION  (NEW v4.2)
-    # Run classification under the alternative hypothesis (VERIDAH shifted +1)
-    # Only when alignment_result suggests H1 is plausible (VD L6 present)
+    # ENSEMBLE CLASSIFICATION  (v4.3 — generalised offset model)
+    # Always store the primary ("at_zero") result on AlignmentResult.
+    # When best_offset != 0, also run classification under the offset hypothesis
+    # using the TV implied by that offset, and store as "at_best".
     # ══════════════════════════════════════════════════════════════════════════
-    if alignment_result is not None and alignment_result.vd_l6_present:
-        try:
-            _run_ensemble_h1(
-                study_id, alignment_result,
-                sag_sp, sag_vert, sag_tss, vox_mm,
-                p2_available, ax_sp, ax_tss, ax_t2w, ax_vox_mm_val,
-                tss_highest_lumbar, vert_unique,
-            )
-        except Exception as exc:
-            logger.error(f"  [{study_id}] H1 ensemble classification failed: {exc}")
-            logger.debug(traceback.format_exc())
-    elif alignment_result is not None:
-        # H0 is the only hypothesis; copy primary results across
-        alignment_result.castellvi_h0  = out.get('castellvi_type')
-        alignment_result.phenotype_h0  = None   # populated after morpho
-        alignment_result.lstv_detected_h0 = out.get('lstv_detected')
-        alignment_result.castellvi_h1  = None
-        alignment_result.phenotype_h1  = None
-        alignment_result.lstv_detected_h1 = None
+    if alignment_result is not None:
+        # Store primary classification as "at_zero" (TSS-guided TV = offset=0)
+        alignment_result.castellvi_at_zero    = out.get('castellvi_type')
+        alignment_result.lstv_detected_at_zero = out.get('lstv_detected', False)
+        alignment_result.phenotype_at_zero    = None   # filled after morpho below
+
+        # Run alternative classification only when offset disagrees
+        if alignment_result.best_offset is not None and alignment_result.best_offset != 0:
+            try:
+                _run_ensemble_offset(
+                    study_id, alignment_result,
+                    sag_sp, sag_vert, sag_tss, vox_mm,
+                    p2_available, ax_sp, ax_tss, ax_t2w, ax_vox_mm_val,
+                    tss_highest_lumbar, vert_unique,
+                )
+            except Exception as exc:
+                logger.error(f"  [{study_id}] Ensemble offset classification failed: {exc}")
+                logger.debug(traceback.format_exc())
+        else:
+            alignment_result.castellvi_at_best    = None
+            alignment_result.phenotype_at_best    = None
+            alignment_result.lstv_detected_at_best = None
 
     # ══════════════════════════════════════════════════════════════════════════
     # MORPHOMETRICS
@@ -884,10 +888,10 @@ def classify_study(study_id:       str,
 
             # ── Back-fill alignment result with phenotype ─────────────────────
             if alignment_result is not None:
-                alignment_result.phenotype_h0  = phenotype
-                alignment_result.lstv_detected_h0 = out.get('lstv_detected')
-                if alignment_result.castellvi_h0 is None:
-                    alignment_result.castellvi_h0 = out.get('castellvi_type')
+                alignment_result.phenotype_at_zero    = phenotype
+                alignment_result.lstv_detected_at_zero = out.get('lstv_detected', False)
+                if alignment_result.castellvi_at_zero is None:
+                    alignment_result.castellvi_at_zero = out.get('castellvi_type')
                 # Update serialised copy
                 out['alignment'] = alignment_result.to_dict()
 
@@ -926,55 +930,133 @@ def classify_study(study_id:       str,
 
 # ── H1 ensemble helper ────────────────────────────────────────────────────────
 
-def _run_ensemble_h1(
-        study_id:          str,
-        ar:                AlignmentResult,
-        sag_sp:            np.ndarray,
-        sag_vert:          np.ndarray,
-        sag_tss:           np.ndarray,
-        vox_mm:            np.ndarray,
-        p2_available:      bool,
+def _run_ensemble_offset(
+        study_id:           str,
+        ar:                 AlignmentResult,
+        sag_sp:             np.ndarray,
+        sag_vert:           np.ndarray,
+        sag_tss:            np.ndarray,
+        vox_mm:             np.ndarray,
+        p2_available:       bool,
         ax_sp, ax_tss, ax_t2w, ax_vox_mm,
         tss_highest_lumbar: Optional[int],
         vert_unique:        List[int],
 ) -> None:
     """
-    Run Phase 1 classification under the H1 (VERIDAH shifted) hypothesis.
-    Under H1 the TV is one level higher: if preferred is L5, H1 TV is L6.
-    The H1 result is stored directly on the AlignmentResult object.
+    Run Castellvi classification under the alternative offset hypothesis and
+    store the result in AlignmentResult.castellvi_at_best / lstv_detected_at_best.
+
+    TV selection by offset:
+        offset = +1  (lumbarization — VERIDAH has extra caudal segment)
+            "at_best" TV = VERIDAH's most caudal lumbar label.
+            Interpretation: VERIDAH's L6 (or highest VD lumbar label) is the
+            true transitional vertebra.  The transverse process incident on
+            THAT vertebra is used for Castellvi.
+
+        offset = -1  (sacralization — TSS has extra caudal segment)
+            "at_best" TV = VERIDAH label one level cranial to the primary TV.
+            Interpretation: TSS's L5 is actually S1; the true last mobile
+            lumbar is TSS L4 / VERIDAH L4.  The TP incident on that level
+            is used for Castellvi.
+
+        offset = ±2  analogous but two levels, handled generically.
+
+    Both "at_zero" (TSS-guided L5 as TV) and "at_best" (offset-guided TV)
+    classifications are preserved so the CSV can report both and flag
+    disagreement.
     """
-    # H1 TV: VERIDAH L6 (the "extra" caudal segment)
-    h1_tv_label = VD_L6
-    if h1_tv_label not in vert_unique:
-        ar.castellvi_h1  = None
-        ar.lstv_detected_h1 = None
+    offset = ar.best_offset
+
+    # ── Determine the "at_best" TV label ──────────────────────────────────────
+    # Primary TV under at_zero is TSS's most caudal lumbar → VD equivalent.
+    # Under the offset hypothesis the TV shifts by `offset` levels in VD space.
+    # VD lumbar labels are VD_LUMBAR_BASE(20) .. VD_LUMBAR_MAX(25).
+    # The at_zero TV is the VD label corresponding to tss_highest_lumbar.
+    from vertebral_alignment import VD_LUMBAR_BASE, VD_LUMBAR_MAX
+
+    # Find which VD label the primary classification used (at_zero TV)
+    at_zero_vd = TSS_VERT_TO_VD.get(tss_highest_lumbar)   # e.g. VD_L5 = 24
+
+    if at_zero_vd is None:
+        logger.warning(f"  [{study_id}] Ensemble offset: cannot determine at_zero VD label")
+        ar.castellvi_at_best     = None
+        ar.lstv_detected_at_best = None
         return
 
-    h1_tv_z, _ = get_tv_z_range(sag_vert, sag_tss, h1_tv_label, study_id + '_H1')
-    if h1_tv_z is None:
-        ar.castellvi_h1  = None
-        ar.lstv_detected_h1 = None
+    # at_best TV is shifted by `offset` in VD label space
+    # offset=+1 → TV = VD_L6 (one more caudal)
+    # offset=-1 → TV = VD_L4 (one more cranial)
+    at_best_vd = at_zero_vd + offset
+
+    if not (VD_LUMBAR_BASE <= at_best_vd <= VD_LUMBAR_MAX):
+        logger.warning(
+            f"  [{study_id}] Ensemble offset {offset:+d}: computed TV VD{at_best_vd} "
+            f"out of valid range [{VD_LUMBAR_BASE},{VD_LUMBAR_MAX}]")
+        ar.castellvi_at_best     = None
+        ar.lstv_detected_at_best = None
         return
 
-    # For H1 the segmental axis: TSS is shifted, so references are one level up
-    seg_axis_h1, _ = compute_segmental_axis(
-        sag_tss, sag_vert, h1_tv_label, vox_mm, study_id + '_H1')
+    if at_best_vd not in vert_unique:
+        logger.warning(
+            f"  [{study_id}] Ensemble offset {offset:+d}: TV VD{at_best_vd} "
+            f"({VERIDAH_NAMES.get(at_best_vd,'?')}) not present in VERIDAH")
+        ar.castellvi_at_best     = None
+        ar.lstv_detected_at_best = None
+        return
 
-    left_h1  = phase1_sagittal('left_H1',  SP_TP_L, sag_sp, sag_tss, vox_mm,
-                                h1_tv_z, seg_axis_h1, 'H1')
-    right_h1 = phase1_sagittal('right_H1', SP_TP_R, sag_sp, sag_tss, vox_mm,
-                                h1_tv_z, seg_axis_h1, 'H1')
+    at_best_name = VERIDAH_NAMES.get(at_best_vd, f'VD{at_best_vd}')
+    logger.info(
+        f"  [{study_id}_ens] Ensemble offset={offset:+d}: "
+        f"at_zero TV=VD{at_zero_vd}({VERIDAH_NAMES.get(at_zero_vd,'?')}) "
+        f"→ at_best TV=VD{at_best_vd}({at_best_name})")
 
-    conf_ref   = ['high']
-    ct_h1, left_h1, right_h1 = finalise_castellvi(
-        left_h1, right_h1, p2_available,
+    # ── TV Z-range for at_best TV ──────────────────────────────────────────────
+    tv_z_best, _ = get_tv_z_range(sag_vert, sag_tss, at_best_vd,
+                                   study_id + '_ens')
+    if tv_z_best is None:
+        logger.warning(f"  [{study_id}_ens] TV Z-range unavailable for VD{at_best_vd}")
+        ar.castellvi_at_best     = None
+        ar.lstv_detected_at_best = None
+        return
+
+    # ── Segmental axis for at_best TV ─────────────────────────────────────────
+    seg_axis_best, _ = compute_segmental_axis(
+        sag_tss, sag_vert, at_best_vd, vox_mm, study_id + '_ens')
+
+    # ── Phase 1 for both sides using at_best TV ────────────────────────────────
+    left_best  = phase1_sagittal('left_ens',  SP_TP_L, sag_sp, sag_tss, vox_mm,
+                                  tv_z_best, seg_axis_best, 'ens')
+    right_best = phase1_sagittal('right_ens', SP_TP_R, sag_sp, sag_tss, vox_mm,
+                                  tv_z_best, seg_axis_best, 'ens')
+
+    logger.info(
+        f"  left_ens  P1: {left_best['classification']:22s} "
+        f"h={left_best['tp_height_mm']:.1f}mm  d={left_best['dist_mm']:.1f}mm  "
+        f"z=[{left_best.get('tp_z_min_vox','?')},{left_best.get('tp_z_max_vox','?')}]")
+    logger.info(
+        f"  right_ens P1: {right_best['classification']:22s} "
+        f"h={right_best['tp_height_mm']:.1f}mm  d={right_best['dist_mm']:.1f}mm  "
+        f"z=[{right_best.get('tp_z_min_vox','?')},{right_best.get('tp_z_max_vox','?')}]")
+
+    # ── Phase 1+2 → Castellvi ─────────────────────────────────────────────────
+    conf_ref = ['high']
+    ct_best, left_best, right_best = finalise_castellvi(
+        left_best, right_best, p2_available,
         ax_sp, ax_tss, ax_t2w, ax_vox_mm, conf_ref)
 
-    ar.castellvi_h1     = ct_h1
-    ar.lstv_detected_h1 = bool(ct_h1)
+    ar.castellvi_at_best     = ct_best
+    ar.lstv_detected_at_best = bool(ct_best)
 
-    logger.info(f"  [{study_id}] H1 ensemble Castellvi: {ct_h1 or 'None'} "
-                f"(TV=L6, h1_tv_z={h1_tv_z})")
+    logger.info(
+        f"  [{study_id}_ens] Ensemble Castellvi offset={offset:+d}: "
+        f"{ct_best or 'None'}  (TV={at_best_name}, tv_z={tv_z_best})")
+
+    # ── Flag disagreement ──────────────────────────────────────────────────────
+    if ar.castellvi_at_zero != ar.castellvi_at_best:
+        logger.info(
+            f"  [{study_id}_ens] ⚠ CASTELLVI DISAGREES: "
+            f"at_zero={ar.castellvi_at_zero or 'None'} "
+            f"vs at_best(offset={offset:+d})={ct_best or 'None'}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1081,17 +1163,17 @@ def main() -> int:
 
             # ── Alignment frequency ────────────────────────────────────────────
             if ar is not None:
-                if   ar.preferred_hypothesis == 'H0_aligned':      n_h0   += 1
-                elif ar.preferred_hypothesis == 'H1_shifted':       n_h1   += 1
+                if   ar.preferred_hypothesis == 'aligned':      n_h0   += 1
+                elif ar.preferred_hypothesis == 'shifted_plus_1':       n_h1   += 1
                 elif ar.preferred_hypothesis == 'insufficient_data': n_insuf += 1
 
-                if ar.vd_l6_present:
+                if 25 in (ar.vd_labels_present or []):
                     n_l6 += 1
-                    if ar.preferred_hypothesis == 'H1_shifted':   n_l6_confirmed += 1
-                    elif ar.preferred_hypothesis == 'H0_aligned': n_l6_rejected  += 1
+                    if ar.preferred_hypothesis == 'shifted_plus_1':   n_l6_confirmed += 1
+                    elif ar.preferred_hypothesis == 'aligned': n_l6_rejected  += 1
 
-                if (ar.castellvi_h0 != ar.castellvi_h1 or
-                        ar.phenotype_h0 != ar.phenotype_h1):
+                if (ar.castellvi_at_zero != ar.castellvi_at_best or
+                        ar.phenotype_at_zero != ar.phenotype_at_best):
                     n_classification_changed += 1
 
         except Exception as exc:
