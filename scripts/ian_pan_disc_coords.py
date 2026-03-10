@@ -128,32 +128,65 @@ IMAGE_SIZE   = 160
 DISC_NAMES   = ["l1_l2", "l2_l3", "l3_l4", "l4_l5", "l5_s1"]
 DISC_INDICES = [1, 2, 3, 4, 5]   # indices in the 6-channel output (0 = background)
 
-# TSS disc labels (from lstv_engine constants)
-# H0 hypothesis: TSS labels are correct — Ian Pan disc k should match TSS disc k
+# ── TSS disc label mappings ───────────────────────────────────────────────────
+# From TotalSpineSeg label table (tss_map.json):
+#   91  disc_T12_L1
+#   92  disc_L1_L2
+#   93  disc_L2_L3
+#   94  disc_L3_L4   ← previously skipped in error
+#   95  disc_L4_L5
+#   100 disc_L5_S
+
+# H0 hypothesis: normal anatomy / sacralization
+# Ian Pan disc k aligns with TSS disc k (both models agree on level identity)
 TSS_DISC_MAP_H0 = {
-    "l1_l2": 91,
-    "l2_l3": 92,
-    "l3_l4": 93,
-    "l4_l5": 95,
-    "l5_s1": 100,
+    "l1_l2": 92,    # disc_L1_L2
+    "l2_l3": 93,    # disc_L2_L3
+    "l3_l4": 94,    # disc_L3_L4
+    "l4_l5": 95,    # disc_L4_L5
+    "l5_s1": 100,   # disc_L5_S
 }
 
-# H1 hypothesis: lumbarization — SPINEPS found an extra caudal mobile segment,
-# so Ian Pan's disc k corresponds to TSS disc k-1 (one level cranial in TSS).
-# Concretely: if S1 is lumbarized (becomes L6), TSS's "L5" is really L6,
-# so Ian Pan's L5-S1 heatmap peak should land near TSS label 95 (L4-L5),
-# Ian Pan's L4-L5 should land near TSS label 93 (L3-L4), etc.
-# Levels where the shift goes above L1 have no TSS disc match → None.
+# H1 hypothesis: lumbarization
+# SPINEPS detects an extra mobile segment at the bottom; TSS labels are one
+# level too cranial relative to what Ian Pan expects as "L5-S1".
+# Concretely: Ian Pan's L5-S1 peak fires on the junction TSS calls L4-L5 (95),
+# Ian Pan's L4-L5 peak fires on the junction TSS calls L3-L4 (94), etc.
+# The topmost level (L1-L2) shifts to align with TSS disc T12-L1 (91).
 TSS_DISC_MAP_H1 = {
-    "l1_l2": None,   # shifted cranial past available TSS labels
-    "l2_l3": 91,     # IP L2-L3  ↔  TSS L1-L2
-    "l3_l4": 92,     # IP L3-L4  ↔  TSS L2-L3
-    "l4_l5": 93,     # IP L4-L5  ↔  TSS L3-L4
-    "l5_s1": 95,     # IP L5-S1  ↔  TSS L4-L5  (the key discriminating level)
+    "l1_l2": 91,    # IP L1-L2  ↔  TSS T12-L1  (disc_T12_L1)
+    "l2_l3": 92,    # IP L2-L3  ↔  TSS L1-L2
+    "l3_l4": 93,    # IP L3-L4  ↔  TSS L2-L3
+    "l4_l5": 94,    # IP L4-L5  ↔  TSS L3-L4
+    "l5_s1": 95,    # IP L5-S1  ↔  TSS L4-L5  ← key discriminating level
 }
 
 # For legacy compatibility — default to H0
 TSS_DISC_MAP = TSS_DISC_MAP_H0
+
+# ── SPINEPS disc label mappings ───────────────────────────────────────────────
+# From SPINEPS output documentation (seg-vert_msk.nii.gz):
+#   Lumbar vertebrae: 20-25  (L1-L6, where L6 is present only in lumbarization)
+#   Disc labels:
+#     120  L1-L2 disc
+#     121  L2-L3 disc
+#     122  L3-L4 disc
+#     123  L4-L5 disc
+#     124  L5-S1 disc  (absent or partial in sacralization)
+#     126  S1-S2 disc  (sacralization marker — only present if L5 is fused to S1)
+
+# H0: Ian Pan disc k aligns with SPINEPS disc k (normal anatomy)
+SPINEPS_DISC_MAP_H0 = {
+    "l1_l2": 120,
+    "l2_l3": 121,
+    "l3_l4": 122,
+    "l4_l5": 123,
+    "l5_s1": 124,
+}
+
+# Label that SPINEPS uses to mark an S1-S2 disc — only segmented when L5 is
+# partially sacralized.  Its presence is a strong sacralization signal.
+SPINEPS_SACRALIZATION_LABEL = 126
 
 # Ian Pan confidence thresholds (tuned on Kaggle val set)
 HIGH_CONF_THRESH   = 0.70
@@ -491,56 +524,106 @@ def _nifti_label_centroid_ras(nii_path: Path, label: int) -> Optional[np.ndarray
         return None
 
 
+def _nifti_label_exists(nii_path: Path, label: int) -> bool:
+    """Return True if the given label is present anywhere in the NIfTI volume."""
+    if not HAS_NIBABEL or not nii_path.exists():
+        return False
+    try:
+        nii  = nib.load(str(nii_path))
+        data = nii.get_fdata()
+        while data.ndim > 3:
+            data = data[..., 0]
+        return bool((data.astype(int) == label).any())
+    except Exception as e:
+        logger.warning(f"  label_exists({nii_path.name}, label={label}): {e}")
+        return False
+
+
 def compute_model_agreement(
-    disc_coords:      Dict,
-    spineps_vert_path: Path,   # seg-vert_msk.nii.gz  (reserved for future use)
-    tss_sag_path:     Path,    # sagittal_labeled.nii.gz
+    disc_coords:       Dict,
+    spineps_vert_path: Path,   # seg-vert_msk.nii.gz  (SPINEPS instance seg)
+    tss_sag_path:      Path,   # sagittal_labeled.nii.gz  (TSS output)
 ) -> Dict:
     """
-    For every disc level, compute Ian Pan ↔ TSS centroid distances under
-    BOTH hypotheses, then compute a sequence-level vote.
+    For every disc level, compute Ian Pan ↔ TSS and Ian Pan ↔ SPINEPS centroid
+    distances under both H0/H1 hypotheses, then compute a sequence-level vote.
+
+    TSS label reference (tss_map.json):
+      91=disc_T12_L1  92=disc_L1_L2  93=disc_L2_L3  94=disc_L3_L4
+      95=disc_L4_L5  100=disc_L5_S
+
+    SPINEPS disc label reference (seg-vert_msk.nii.gz):
+      120=L1-L2  121=L2-L3  122=L3-L4  123=L4-L5  124=L5-S1
+      126=S1-S2 (sacralization marker — only present when L5 is fused to S1)
 
     Per-level fields
     ----------------
-    ip_coords_valid    : bool    False if Ian Pan returned no RAS coord
-    peak_prob          : float   Ian Pan peak probability (copied for convenience)
-    dist_to_tss_h0_mm  : float | None  dist(IP_k, TSS_disc_k)       — H0
-    dist_to_tss_h1_mm  : float | None  dist(IP_k, TSS_disc_{k-1})   — H1 shifted
-    tss_centroid_h0_ras: list | None   TSS centroid under H0
-    tss_centroid_h1_ras: list | None   TSS centroid under H1
+    ip_coords_valid      : bool    False if Ian Pan returned no RAS coord
+    peak_prob            : float   Ian Pan peak probability
+    dist_to_tss_h0_mm    : float | None  dist(IP_k, TSS_disc_k)       — H0
+    dist_to_tss_h1_mm    : float | None  dist(IP_k, TSS_disc_{k-1})   — H1
+    tss_centroid_h0_ras  : list | None   TSS centroid under H0
+    tss_centroid_h1_ras  : list | None   TSS centroid under H1
+    dist_to_spineps_mm   : float | None  dist(IP_k, SPINEPS_disc_k)   — H0 only
+    spineps_centroid_ras : list | None   SPINEPS disc centroid
 
     Top-level summary fields (under key '_sequence_vote')
     -----------------------------------------------------
-    n_levels_h0        : int    levels with valid H0 distance
-    n_levels_h1        : int    levels with valid H1 distance
-    mean_dist_h0_mm    : float  mean H0 distance (only confident IP levels)
-    mean_dist_h1_mm    : float  mean H1 distance (only confident IP levels)
-    margin_mm          : float  mean_dist_h0 - mean_dist_h1
-                                 > 0  → H0 better (TSS labels correct)
-                                 < 0  → H1 better (TSS shifted, lumbarization)
-    sequence_vote      : str    'H0' | 'H1' | 'neutral'
-    vote_confidence    : str    'high' | 'moderate' | 'low' | 'insufficient'
-    n_levels_voted     : int    number of disc levels that contributed
+    n_levels_voted       : int    disc levels contributing to paired vote
+    n_levels_h0          : int    levels with valid H0 TSS distance
+    n_levels_h1          : int    levels with valid H1 TSS distance
+    mean_dist_h0_mm      : float  mean Ian Pan ↔ TSS distance under H0
+    mean_dist_h1_mm      : float  mean Ian Pan ↔ TSS distance under H1
+    margin_mm            : float  mean_dist_h1 - mean_dist_h0
+                                   > 0  → H0 wins  (H1 distances larger)
+                                   < 0  → H1 wins  (H0 distances larger)
+    sequence_vote        : str    'H0' | 'H1' | 'neutral'
+    vote_confidence      : str    'high' | 'moderate' | 'low' | 'insufficient'
+    spineps_sacralization_marker : bool
+                                  True if SPINEPS label 126 (S1-S2 disc) is
+                                  present — strong independent sacralization signal
+    mean_dist_spineps_mm : float | None  mean Ian Pan ↔ SPINEPS H0 distance
+    n_levels_spineps     : int    levels with valid SPINEPS distance
 
     H0: Ian Pan disc k aligns with TSS disc k  (normal anatomy / sacralization)
     H1: Ian Pan disc k aligns with TSS disc k-1 (lumbarization — extra mobile
-        segment means TSS's labels are one level too cranial for SPINEPS).
+        segment means Ian Pan's peaks are all shifted one level caudal vs TSS)
     """
-    # ── Pre-load all needed TSS centroids in one pass ──────────────────────────
-    all_tss_labels = set()
+
+    # ── Pre-load all needed TSS centroids in one pass ─────────────────────────
+    all_tss_labels: set = set()
     for lbl in TSS_DISC_MAP_H0.values():
-        if lbl: all_tss_labels.add(lbl)
+        if lbl is not None:
+            all_tss_labels.add(lbl)
     for lbl in TSS_DISC_MAP_H1.values():
-        if lbl: all_tss_labels.add(lbl)
+        if lbl is not None:
+            all_tss_labels.add(lbl)
 
     tss_centroids: Dict[int, Optional[np.ndarray]] = {}
     for lbl in all_tss_labels:
         tss_centroids[lbl] = _nifti_label_centroid_ras(tss_sag_path, lbl)
 
-    # ── Per-level distances ────────────────────────────────────────────────────
+    # ── Pre-load SPINEPS disc centroids (H0 only) ─────────────────────────────
+    spineps_centroids: Dict[int, Optional[np.ndarray]] = {}
+    spineps_available = spineps_vert_path is not None and spineps_vert_path.exists()
+    if spineps_available:
+        for lbl in SPINEPS_DISC_MAP_H0.values():
+            spineps_centroids[lbl] = _nifti_label_centroid_ras(spineps_vert_path, lbl)
+        # Check sacralization marker
+        spineps_sac_marker = _nifti_label_exists(
+            spineps_vert_path, SPINEPS_SACRALIZATION_LABEL)
+        if spineps_sac_marker:
+            logger.info("  SPINEPS: sacralization marker label 126 (S1-S2 disc) PRESENT ⚠")
+    else:
+        spineps_sac_marker = False
+        if spineps_vert_path is not None:
+            logger.warning(f"  SPINEPS seg not found: {spineps_vert_path}")
+
+    # ── Per-level distances ───────────────────────────────────────────────────
     agreement: Dict = {}
     h0_dists: List[float] = []
     h1_dists: List[float] = []
+    spineps_dists: List[float] = []
 
     for disc_name in DISC_NAMES:
         entry  = disc_coords.get(disc_name, {})
@@ -554,9 +637,9 @@ def compute_model_agreement(
         ip_arr = np.array(ip_ras)
         row: Dict = {"ip_coords_valid": True, "peak_prob": round(prob, 5)}
 
-        # H0 distance: Ian Pan disc k  ↔  TSS disc k
+        # ── TSS H0: Ian Pan disc k  ↔  TSS disc k ────────────────────────────
         lbl_h0 = TSS_DISC_MAP_H0.get(disc_name)
-        ctr_h0 = tss_centroids.get(lbl_h0) if lbl_h0 else None
+        ctr_h0 = tss_centroids.get(lbl_h0) if lbl_h0 is not None else None
         if ctr_h0 is not None:
             d_h0 = float(np.linalg.norm(ip_arr - ctr_h0))
             row["dist_to_tss_h0_mm"]   = round(d_h0, 2)
@@ -566,9 +649,9 @@ def compute_model_agreement(
             row["dist_to_tss_h0_mm"]   = None
             row["tss_centroid_h0_ras"] = None
 
-        # H1 distance: Ian Pan disc k  ↔  TSS disc k-1  (shifted hypothesis)
+        # ── TSS H1: Ian Pan disc k  ↔  TSS disc k-1 ──────────────────────────
         lbl_h1 = TSS_DISC_MAP_H1.get(disc_name)
-        ctr_h1 = tss_centroids.get(lbl_h1) if lbl_h1 else None
+        ctr_h1 = tss_centroids.get(lbl_h1) if lbl_h1 is not None else None
         if ctr_h1 is not None:
             d_h1 = float(np.linalg.norm(ip_arr - ctr_h1))
             row["dist_to_tss_h1_mm"]   = round(d_h1, 2)
@@ -578,79 +661,101 @@ def compute_model_agreement(
             row["dist_to_tss_h1_mm"]   = None
             row["tss_centroid_h1_ras"] = None
 
-        # Only include in sequence vote if Ian Pan is sufficiently confident
+        # ── SPINEPS H0: Ian Pan disc k  ↔  SPINEPS disc k ────────────────────
+        sp_lbl = SPINEPS_DISC_MAP_H0.get(disc_name)
+        ctr_sp = spineps_centroids.get(sp_lbl) if (spineps_available and sp_lbl) else None
+        if ctr_sp is not None:
+            d_sp = float(np.linalg.norm(ip_arr - ctr_sp))
+            row["dist_to_spineps_mm"]   = round(d_sp, 2)
+            row["spineps_centroid_ras"] = ctr_sp.tolist()
+        else:
+            d_sp = None
+            row["dist_to_spineps_mm"]   = None
+            row["spineps_centroid_ras"] = None
+
+        # ── Accumulate for sequence vote (TSS only, confident levels only) ────
         if prob >= SEQ_VOTE_MIN_PROB:
-            if d_h0 is not None: h0_dists.append(d_h0)
-            if d_h1 is not None: h1_dists.append(d_h1)
+            if d_h0 is not None:
+                h0_dists.append(d_h0)
+            if d_h1 is not None:
+                h1_dists.append(d_h1)
+            if d_sp is not None:
+                spineps_dists.append(d_sp)
 
         agreement[disc_name] = row
 
-    # ── Sequence-level vote ────────────────────────────────────────────────────
-    n_voted = min(len(h0_dists), len(h1_dists))
+    # ── Sequence-level vote ───────────────────────────────────────────────────
+    # Re-pair strictly: only levels where BOTH H0 and H1 TSS distances exist
+    paired_h0: List[float] = []
+    paired_h1: List[float] = []
+    for disc_name in DISC_NAMES:
+        row = agreement.get(disc_name, {})
+        d0  = row.get("dist_to_tss_h0_mm")
+        d1  = row.get("dist_to_tss_h1_mm")
+        p   = row.get("peak_prob", 0.0)
+        if d0 is not None and d1 is not None and p >= SEQ_VOTE_MIN_PROB:
+            paired_h0.append(d0)
+            paired_h1.append(d1)
+
+    n_voted = len(paired_h0)
+    mean_h0: Optional[float] = float(np.mean(paired_h0)) if paired_h0 else None
+    mean_h1: Optional[float] = float(np.mean(paired_h1)) if paired_h1 else None
+    mean_spineps: Optional[float] = (float(np.mean(spineps_dists))
+                                     if spineps_dists else None)
 
     if n_voted < 2:
-        seq_vote = "neutral"
+        seq_vote  = "neutral"
         vote_conf = "insufficient"
-        margin = 0.0
-        mean_h0 = float(np.mean(h0_dists)) if h0_dists else None
-        mean_h1 = float(np.mean(h1_dists)) if h1_dists else None
+        margin    = 0.0
     else:
-        # Use only levels that contributed to BOTH hypotheses for fair comparison
-        # (pair them by position in DISC_NAMES order)
-        paired_h0, paired_h1 = [], []
-        for disc_name in DISC_NAMES:
-            row = agreement.get(disc_name, {})
-            d0  = row.get("dist_to_tss_h0_mm")
-            d1  = row.get("dist_to_tss_h1_mm")
-            p   = row.get("peak_prob", 0.0)
-            if d0 is not None and d1 is not None and p >= SEQ_VOTE_MIN_PROB:
-                paired_h0.append(d0)
-                paired_h1.append(d1)
+        # margin = mean_h1 - mean_h0
+        #   > 0  → H1 distances are larger → H0 wins (Ian Pan aligns with TSS labels)
+        #   < 0  → H0 distances are larger → H1 wins (Ian Pan shifted vs TSS)
+        margin = mean_h1 - mean_h0   # type: ignore[operator]
 
-        n_voted = len(paired_h0)
-        if n_voted < 2:
-            seq_vote = "neutral"
-            vote_conf = "insufficient"
-            margin = 0.0
-            mean_h0 = float(np.mean(paired_h0)) if paired_h0 else None
-            mean_h1 = float(np.mean(paired_h1)) if paired_h1 else None
+        if abs(margin) < SEQ_VOTE_MIN_MARGIN_MM:
+            seq_vote  = "neutral"
+            vote_conf = "low"
+        elif margin > 0:
+            # H1 distances are larger → H0 wins (TSS labels align with Ian Pan)
+            seq_vote  = "H0"
+            vote_conf = ("high"     if abs(margin) > 20.0 else
+                         "moderate" if abs(margin) > SEQ_VOTE_MIN_MARGIN_MM else "low")
         else:
-            mean_h0 = float(np.mean(paired_h0))
-            mean_h1 = float(np.mean(paired_h1))
-            margin  = mean_h0 - mean_h1   # positive = H0 better, negative = H1 better
-
-            if abs(margin) < SEQ_VOTE_MIN_MARGIN_MM:
-                seq_vote  = "neutral"
-                vote_conf = "low"
-            elif margin > 0:
-                # H0 has smaller mean distance → TSS labels match Ian Pan
-                seq_vote  = "H0"
-                vote_conf = ("high"     if abs(margin) > 20.0 else
-                             "moderate" if abs(margin) > SEQ_VOTE_MIN_MARGIN_MM else "low")
-            else:
-                # H1 has smaller mean distance → TSS shifted, SPINEPS has extra level
-                seq_vote  = "H1"
-                vote_conf = ("high"     if abs(margin) > 20.0 else
-                             "moderate" if abs(margin) > SEQ_VOTE_MIN_MARGIN_MM else "low")
+            # H0 distances are larger → H1 wins (lumbarization — Ian Pan shifted)
+            seq_vote  = "H1"
+            vote_conf = ("high"     if abs(margin) > 20.0 else
+                         "moderate" if abs(margin) > SEQ_VOTE_MIN_MARGIN_MM else "low")
 
     agreement["_sequence_vote"] = {
-        "n_levels_voted":   n_voted,
-        "n_levels_h0":      len(h0_dists),
-        "n_levels_h1":      len(h1_dists),
-        "mean_dist_h0_mm":  round(mean_h0, 2) if mean_h0 is not None else None,
-        "mean_dist_h1_mm":  round(mean_h1, 2) if mean_h1 is not None else None,
-        "margin_mm":        round(margin, 2),
-        "sequence_vote":    seq_vote,
-        "vote_confidence":  vote_conf,
+        "n_levels_voted":             n_voted,
+        "n_levels_h0":                len(h0_dists),
+        "n_levels_h1":                len(h1_dists),
+        "mean_dist_h0_mm":            round(mean_h0, 2)       if mean_h0 is not None       else None,
+        "mean_dist_h1_mm":            round(mean_h1, 2)       if mean_h1 is not None       else None,
+        "margin_mm":                  round(margin, 2),
+        "sequence_vote":              seq_vote,
+        "vote_confidence":            vote_conf,
+        # SPINEPS supplementary agreement
+        "spineps_sacralization_marker": spineps_sac_marker,
+        "mean_dist_spineps_mm":       round(mean_spineps, 2)  if mean_spineps is not None  else None,
+        "n_levels_spineps":           len(spineps_dists),
     }
 
-    logger.info(
-        f"  Seq vote: H0={mean_h0:.1f}mm  H1={mean_h1:.1f}mm  "
-        f"margin={margin:+.1f}mm  → {seq_vote} [{vote_conf}]  "
-        f"(n={n_voted} disc levels)"
-        if (mean_h0 is not None and mean_h1 is not None)
-        else f"  Seq vote: insufficient data (n_paired={n_voted})"
-    )
+    if mean_h0 is not None and mean_h1 is not None:
+        logger.info(
+            f"  Seq vote: H0={mean_h0:.1f}mm  H1={mean_h1:.1f}mm  "
+            f"margin(H1-H0)={margin:+.1f}mm  → {seq_vote} [{vote_conf}]  "
+            f"(n={n_voted} paired levels)"
+        )
+        if mean_spineps is not None:
+            logger.info(
+                f"  SPINEPS agreement: mean={mean_spineps:.1f}mm  "
+                f"(n={len(spineps_dists)} levels)  "
+                f"sac_marker={spineps_sac_marker}"
+            )
+    else:
+        logger.info(f"  Seq vote: insufficient paired data (n={n_voted})")
 
     return agreement
 
@@ -731,26 +836,32 @@ def _flat_row(record: dict) -> dict:
         row[f"{prefix}_ras_x"]              = ras[0] if ras else None
         row[f"{prefix}_ras_y"]              = ras[1] if ras else None
         row[f"{prefix}_ras_z"]              = ras[2] if ras else None
-        # H0 and H1 distances
-        row[f"{prefix}_dist_h0_mm"]         = agr.get("dist_to_tss_h0_mm")
-        row[f"{prefix}_dist_h1_mm"]         = agr.get("dist_to_tss_h1_mm")
-        # Convenience: which hypothesis is closer for this level?
-        d0 = agr.get("dist_to_tss_h0_mm"); d1 = agr.get("dist_to_tss_h1_mm")
+        # TSS H0 and H1 distances
+        row[f"{prefix}_dist_tss_h0_mm"]     = agr.get("dist_to_tss_h0_mm")
+        row[f"{prefix}_dist_tss_h1_mm"]     = agr.get("dist_to_tss_h1_mm")
+        # Which TSS hypothesis is closer for this level?
+        d0 = agr.get("dist_to_tss_h0_mm")
+        d1 = agr.get("dist_to_tss_h1_mm")
         if d0 is not None and d1 is not None:
-            row[f"{prefix}_closer_hyp"] = "H0" if d0 <= d1 else "H1"
-            row[f"{prefix}_hyp_margin_mm"] = round(abs(d0 - d1), 2)
+            row[f"{prefix}_closer_hyp"]      = "H0" if d0 <= d1 else "H1"
+            row[f"{prefix}_hyp_margin_mm"]   = round(abs(d0 - d1), 2)
         else:
-            row[f"{prefix}_closer_hyp"]    = None
-            row[f"{prefix}_hyp_margin_mm"] = None
+            row[f"{prefix}_closer_hyp"]      = None
+            row[f"{prefix}_hyp_margin_mm"]   = None
+        # SPINEPS H0 distance
+        row[f"{prefix}_dist_spineps_mm"]     = agr.get("dist_to_spineps_mm")
 
     # Sequence vote summary
     sv = record.get("model_agreement", {}).get("_sequence_vote", {})
-    row["seq_vote"]          = sv.get("sequence_vote")
-    row["seq_vote_conf"]     = sv.get("vote_confidence")
-    row["seq_margin_mm"]     = sv.get("margin_mm")
-    row["seq_mean_h0_mm"]    = sv.get("mean_dist_h0_mm")
-    row["seq_mean_h1_mm"]    = sv.get("mean_dist_h1_mm")
-    row["seq_n_levels_voted"]= sv.get("n_levels_voted")
+    row["seq_vote"]                    = sv.get("sequence_vote")
+    row["seq_vote_conf"]               = sv.get("vote_confidence")
+    row["seq_margin_mm"]               = sv.get("margin_mm")
+    row["seq_mean_h0_mm"]              = sv.get("mean_dist_h0_mm")
+    row["seq_mean_h1_mm"]              = sv.get("mean_dist_h1_mm")
+    row["seq_n_levels_voted"]          = sv.get("n_levels_voted")
+    row["spineps_sac_marker"]          = sv.get("spineps_sacralization_marker")
+    row["seq_mean_spineps_mm"]         = sv.get("mean_dist_spineps_mm")
+    row["seq_n_levels_spineps"]        = sv.get("n_levels_spineps")
     return row
 
 
@@ -769,7 +880,7 @@ def write_csvs(output_dir: Path):
     pd.DataFrame(wide_rows).to_csv(
         output_dir / "ian_pan_disc_coords.csv", index=False)
 
-    # Long CSV (one row per study × disc level, includes H0/H1 distances)
+    # Long CSV (one row per study × disc level)
     long_rows = []
     for r in records:
         sv  = r.get("model_agreement", {}).get("_sequence_vote", {})
@@ -779,29 +890,32 @@ def write_csvs(output_dir: Path):
             ras  = disc.get("world_ras_mm", [None]*3)
             d0   = agr.get("dist_to_tss_h0_mm")
             d1   = agr.get("dist_to_tss_h1_mm")
+            d_sp = agr.get("dist_to_spineps_mm")
             long_rows.append({
-                "study_id":          r["study_id"],
-                "disc_level":        disc_name,
-                "peak_prob":         disc.get("peak_prob"),
-                "entropy":           disc.get("entropy"),
-                "spatial_entropy":   disc.get("spatial_entropy"),
-                "confidence_class":  disc.get("confidence_class"),
-                "ras_x":             ras[0] if ras else None,
-                "ras_y":             ras[1] if ras else None,
-                "ras_z":             ras[2] if ras else None,
-                # H0: Ian Pan disc k  ↔  TSS disc k
-                "dist_h0_mm":        d0,
-                # H1: Ian Pan disc k  ↔  TSS disc k-1  (lumbarization shift)
-                "dist_h1_mm":        d1,
-                "closer_hyp":        ("H0" if (d0 is not None and d1 is not None and d0 <= d1)
-                                      else "H1" if (d0 is not None and d1 is not None)
-                                      else None),
-                "hyp_margin_mm":     (round(abs(d0 - d1), 2)
-                                      if d0 is not None and d1 is not None else None),
+                "study_id":           r["study_id"],
+                "disc_level":         disc_name,
+                "peak_prob":          disc.get("peak_prob"),
+                "entropy":            disc.get("entropy"),
+                "spatial_entropy":    disc.get("spatial_entropy"),
+                "confidence_class":   disc.get("confidence_class"),
+                "ras_x":              ras[0] if ras else None,
+                "ras_y":              ras[1] if ras else None,
+                "ras_z":              ras[2] if ras else None,
+                # TSS distances
+                "dist_tss_h0_mm":     d0,
+                "dist_tss_h1_mm":     d1,
+                "closer_hyp":         ("H0" if (d0 is not None and d1 is not None and d0 <= d1)
+                                       else "H1" if (d0 is not None and d1 is not None)
+                                       else None),
+                "hyp_margin_mm":      (round(abs(d0 - d1), 2)
+                                       if d0 is not None and d1 is not None else None),
+                # SPINEPS distance
+                "dist_spineps_mm":    d_sp,
                 # Study-level sequence vote (repeated per level for easy filtering)
-                "study_seq_vote":    sv.get("sequence_vote"),
-                "study_seq_conf":    sv.get("vote_confidence"),
-                "study_seq_margin":  sv.get("margin_mm"),
+                "study_seq_vote":     sv.get("sequence_vote"),
+                "study_seq_conf":     sv.get("vote_confidence"),
+                "study_seq_margin":   sv.get("margin_mm"),
+                "spineps_sac_marker": sv.get("spineps_sacralization_marker"),
             })
 
     pd.DataFrame(long_rows).to_csv(
@@ -1007,20 +1121,35 @@ def run_inference(args):
 
             # ── NIfTI model agreement (optional) ──────────────────────────
             model_agreement: dict = {}
-            if spineps_dir and totalspine_dir:
+            if totalspine_dir:
                 tss_sag_path = (totalspine_dir / study_id / "sagittal"
                                 / f"{study_id}_sagittal_labeled.nii.gz")
-                spineps_vert = (spineps_dir / "segmentations" / study_id
-                                / f"{study_id}_seg-vert_msk.nii.gz")
+
+                # SPINEPS seg-vert path (None if spineps_dir not provided)
+                spineps_vert = None
+                if spineps_dir:
+                    spineps_vert = (spineps_dir / "segmentations" / study_id
+                                    / f"{study_id}_seg-vert_msk.nii.gz")
+
                 if tss_sag_path.exists():
                     model_agreement = compute_model_agreement(
                         disc_coords, spineps_vert, tss_sag_path)
-                    # Log disagreement summary
-                    for disc_name, agr in model_agreement.items():
-                        d_tss = agr.get("dist_to_tss_mm")
-                        if d_tss is not None:
-                            flag = "⚠" if d_tss > 15.0 else "✓"
-                            logger.info(f"    {disc_name} → TSS: {d_tss:.1f}mm {flag}")
+
+                    # Per-level distance log (TSS H0 as primary indicator)
+                    for disc_name in DISC_NAMES:
+                        agr   = model_agreement.get(disc_name, {})
+                        d_h0  = agr.get("dist_to_tss_h0_mm")
+                        d_h1  = agr.get("dist_to_tss_h1_mm")
+                        d_sp  = agr.get("dist_to_spineps_mm")
+                        if d_h0 is not None:
+                            flag = "⚠" if d_h0 > 15.0 else "✓"
+                            sp_str = f"  SPINEPS={d_sp:.1f}mm" if d_sp is not None else ""
+                            logger.info(
+                                f"    {disc_name} → TSS_H0={d_h0:.1f}mm {flag}"
+                                f"  TSS_H1={d_h1:.1f}mm{sp_str}"
+                                if d_h1 is not None
+                                else f"    {disc_name} → TSS_H0={d_h0:.1f}mm {flag}{sp_str}"
+                            )
                 else:
                     logger.warning(f"  TSS sagittal not found for {study_id}")
 
@@ -1074,7 +1203,9 @@ def load_ian_pan_disc_coords(json_path: str) -> Dict[str, dict]:
         study_ip = ip.get(study_id, {})
         l5s1_conf = study_ip.get('disc_levels', {}).get('l5_s1', {}).get('peak_prob', None)
         l5s1_ras  = study_ip.get('disc_levels', {}).get('l5_s1', {}).get('world_ras_mm', None)
-        dist_tss  = study_ip.get('model_agreement', {}).get('l5_s1', {}).get('dist_to_tss_mm', None)
+        d_tss_h0  = study_ip.get('model_agreement', {}).get('l5_s1', {}).get('dist_to_tss_h0_mm', None)
+        d_spineps = study_ip.get('model_agreement', {}).get('l5_s1', {}).get('dist_to_spineps_mm', None)
+        sac       = study_ip.get('model_agreement', {}).get('_sequence_vote', {}).get('spineps_sacralization_marker', False)
     """
     p = Path(json_path)
     if not p.exists():
@@ -1102,9 +1233,9 @@ def main():
                         help="Ian Pan checkpoint: models/point_net_checkpoint.pth")
     parser.add_argument("--valid_ids",       default="models/valid_id.npy")
     parser.add_argument("--spineps_dir",     default=None,
-                        help="results/spineps — for NIfTI comparison (optional)")
+                        help="results/spineps — for SPINEPS disc distance comparison (optional)")
     parser.add_argument("--totalspine_dir",  default=None,
-                        help="results/totalspineseg — for NIfTI comparison (optional)")
+                        help="results/totalspineseg — for TSS disc distance comparison (optional)")
     parser.add_argument("--mode",            choices=["trial", "debug", "prod"],
                         default="trial")
     parser.add_argument("--trial_size",      type=int, default=3)

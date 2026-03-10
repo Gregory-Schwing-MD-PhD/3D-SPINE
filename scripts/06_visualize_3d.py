@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 """
-06_visualize_3d.py — LSTV-Focused Interactive 3D Spine Viewer (v3.1)
+06_visualize_3d.py — LSTV-Focused Interactive 3D Spine Viewer (v3.2)
 ==============================================================
 Renders 3D interactive HTML for LSTV cases.
+
+CHANGES v3.2
+----------
+  • IAN PAN DISC MARKERS:
+       All five Ian Pan disc-level confidence peaks are rendered as 3D
+       diamond markers when --ian_pan_coords is provided.
+       Colour = confidence class:  green (high) / yellow (medium) / red (low)
+       Label  = disc level + peak_prob + H0/H1 distance comparison + closer hyp
+       A sequence-vote summary marker is added at the midpoint of the disc column.
+       These appear in the Focused view and are togglable via the legend.
 
 CHANGES v3.1
 ----------
@@ -59,6 +69,13 @@ from lstv_engine import (
     compute_lstv_pathology_score,
 )
 
+# ── Optional Ian Pan disc-coord integration ────────────────────────────────────
+try:
+    from ian_pan_disc_coords import load_ian_pan_disc_coords
+    _IAN_PAN_AVAILABLE = True
+except ImportError:
+    _IAN_PAN_AVAILABLE = False
+
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s  %(levelname)-7s  %(message)s')
 logger = logging.getLogger(__name__)
@@ -68,6 +85,9 @@ FOCUSED_VERIDAH_LABELS  = {23, 24, 25, 26}   # L4, L5, L6, Sacrum
 FOCUSED_VERIDAH_IVD     = {23, 24, 25}        # IVDs below L4, L5, L6
 FOCUSED_TSS_LABELS      = {45, 50, 95, 100}   # TSS L5, Sacrum, L4-L5 disc, L5-S1 disc
 FOCUSED_SPINE_LABELS    = {SP_SACRUM, SP_TP_L, SP_TP_R}
+
+# ── Ian Pan disc level names ───────────────────────────────────────────────────
+DISC_NAMES = ["l1_l2", "l2_l3", "l3_l4", "l4_l5", "l5_s1"]
 
 # ── Phenotype colours ─────────────────────────────────────────────────────────
 PHENOTYPE_CONFIG = {
@@ -94,11 +114,6 @@ PHENOTYPE_CONFIG = {
 }
 
 # ── Mesh label tables ──────────────────────────────────────────────────────────
-# COLOR FIX v3.1:
-#   TP-Left  was #ff3333 (red) — clashed with sacralization phenotype & TSS sacrum
-#             now #00ccff (cyan)
-#   TP-Right was #00ccff (cyan) — now #ff6600 (orange)
-#   TSS Sacrum stays #ff8c00 — now unambiguous from both TPs
 SPINE_LABELS: List[Tuple] = [
     (SP_SACRUM, 'Sacrum (spine)',    '#ff8c00', 0.80, True,  1.5),
     (SP_ARCUS,  'Arcus Vertebrae',   '#7744bb', 0.60, True,  1.5),
@@ -406,6 +421,90 @@ def tv_body_annotation_traces(vert_iso: np.ndarray, tv_label: int,
         _line(p_sup, p_inf,  colour,    'TV SI height ruler', width=4),
         _marker(midpt(p_sup, p_inf), f'TV H/AP={h_ap:.2f} ({sc})', colour, size=10, sym='diamond-open'),
     ]
+
+
+# ── Ian Pan disc-level marker traces ──────────────────────────────────────────
+
+def ian_pan_disc_marker_traces(
+    ian_pan_study: dict,
+    origin_mm: np.ndarray,
+) -> List:
+    """
+    Scatter3d markers for ALL five Ian Pan disc peak positions.
+
+    Colour = confidence class:  green (high) / yellow (medium) / red (low)
+    Label  = disc level + peak_prob + H0 and H1 distances + closer hypothesis
+
+    Returns a list of go.Scatter3d traces (empty if ian_pan_study is None/empty).
+    All markers are assigned to the 'focused' group in build_3d_figure().
+    """
+    if not ian_pan_study:
+        return []
+
+    conf_colours = {"high": "#00ff88", "medium": "#ffcc00", "low": "#ff4444"}
+    agr          = ian_pan_study.get("model_agreement", {})
+    disc_levels  = ian_pan_study.get("disc_levels", {})
+    traces: List = []
+
+    for disc_name in DISC_NAMES:
+        lvl  = disc_levels.get(disc_name, {})
+        d_ag = agr.get(disc_name, {})
+
+        ras_mm = lvl.get("world_ras_mm")
+        prob   = lvl.get("peak_prob", 0.0)
+        conf   = lvl.get("confidence_class", "low")
+        colour = conf_colours.get(conf, "#888888")
+
+        if ras_mm is None:
+            continue
+
+        d0 = d_ag.get("dist_to_tss_h0_mm")
+        d1 = d_ag.get("dist_to_tss_h1_mm")
+        if d0 is not None and d1 is not None:
+            closer = "H0" if d0 <= d1 else "H1"
+            margin = abs(d0 - d1)
+            dist_str = f"  d0={d0:.0f} d1={d1:.0f} → {closer} +{margin:.0f}mm"
+        else:
+            dist_str = ""
+
+        label = f"IP {disc_name.replace('_','/')} p={prob:.2f}{dist_str}"
+        disp  = np.array(ras_mm) - origin_mm
+
+        traces.append(go.Scatter3d(
+            x=[float(disp[0])], y=[float(disp[1])], z=[float(disp[2])],
+            mode="markers+text",
+            marker=dict(size=9, color=colour, symbol="diamond", opacity=0.90,
+                        line=dict(color="white", width=1)),
+            text=[label], textposition="top center",
+            textfont=dict(size=9, color=colour),
+            name=label, showlegend=True, hoverinfo="text",
+        ))
+
+    # Sequence vote summary marker (positioned to the right of the disc column)
+    sv        = agr.get("_sequence_vote", {})
+    vote      = sv.get("sequence_vote", "")
+    vote_conf = sv.get("vote_confidence", "")
+    margin_sv = sv.get("margin_mm", 0.0)
+    if vote and vote != "neutral":
+        valid_ras = [
+            np.array(disc_levels[d]["world_ras_mm"])
+            for d in DISC_NAMES
+            if disc_levels.get(d, {}).get("world_ras_mm") is not None
+        ]
+        if valid_ras:
+            mid       = np.mean(valid_ras, axis=0) - origin_mm
+            vote_col  = "#00ff88" if vote == "H0" else "#ff8800"
+            vote_text = f"IP seq: {vote} [{vote_conf}] {margin_sv:+.0f}mm"
+            traces.append(go.Scatter3d(
+                x=[float(mid[0]) + 10], y=[float(mid[1])], z=[float(mid[2])],
+                mode="markers+text",
+                marker=dict(size=5, color=vote_col, symbol="square"),
+                text=[vote_text], textposition="middle right",
+                textfont=dict(size=10, color=vote_col),
+                name=vote_text, showlegend=True, hoverinfo="text",
+            ))
+
+    return traces
 
 
 # ── Clinical narrative generator ───────────────────────────────────────────────
@@ -891,7 +990,18 @@ def build_3d_figure(study_id: str,
                     totalspine_dir: Path,
                     result: dict,
                     smooth: float = 2.0,
-                    show_tss: bool = True):
+                    show_tss: bool = True,
+                    ian_pan_study: Optional[dict] = None):
+    """
+    Build the Plotly 3D figure for one study.
+
+    Parameters
+    ----------
+    ian_pan_study : dict or None
+        Pre-loaded entry from ian_pan_disc_coords.json for this study_id.
+        When provided, all five Ian Pan disc-level peak markers and the
+        sequence-vote summary are added as Scatter3d traces in the focused view.
+    """
     seg_dir   = spineps_dir / 'segmentations' / study_id
     sp_path   = seg_dir / f"{study_id}_seg-spine_msk.nii.gz"
     vert_path = seg_dir / f"{study_id}_seg-vert_msk.nii.gz"
@@ -981,7 +1091,6 @@ def build_3d_figure(study_id: str,
             _add(t, group)
 
     # SPINEPS subregion meshes
-    # COLOR FIX: look up colour from SPINE_LABELS table (not hardcoded inline)
     _spine_col = {lbl: (col, op, fh, mx_s) for lbl, _, col, op, fh, mx_s in SPINE_LABELS}
     for lbl, name, col, op, fh, mx_s in SPINE_LABELS:
         if lbl not in sp_labels: continue
@@ -1032,6 +1141,13 @@ def build_3d_figure(study_id: str,
     _add_all(tp_ruler_traces(tp_R, origin_mm, tp_r_col, 'Right', span_R))
     _add_all(gap_ruler_traces(tp_L, sac_iso, origin_mm, tp_l_col, 'Left',  dist_L))
     _add_all(gap_ruler_traces(tp_R, sac_iso, origin_mm, tp_r_col, 'Right', dist_R))
+
+    # ── Ian Pan disc-level marker traces ──────────────────────────────────────
+    if ian_pan_study is not None:
+        ip_traces = ian_pan_disc_marker_traces(ian_pan_study, origin_mm)
+        if ip_traces:
+            logger.info(f"  [{study_id}] Adding {len(ip_traces)} Ian Pan disc marker traces")
+            _add_all(ip_traces, 'focused')
 
     # ── Bounding boxes ─────────────────────────────────────────────────────────
     ct_has = bool(castellvi and castellvi not in ('None', 'N/A'))
@@ -1087,6 +1203,7 @@ def build_3d_figure(study_id: str,
 
     score     = result.get('pathology_score', 0)
     lstv_flag = '⚠ LSTV' if result.get('lstv_detected') else '✓ Normal'
+    ip_flag   = ' · 🔵 Ian Pan' if ian_pan_study else ''
 
     fig = go.Figure(data=traces)
     fig.update_layout(
@@ -1097,6 +1214,7 @@ def build_3d_figure(study_id: str,
                   f"TV: <b>{tv_name}</b>  ·  "
                   f"Lumbar: <b>{lumbar_count}</b>  ·  "
                   f"{lstv_flag}  ·  Score: <b>{score:.0f}</b>"
+                  + ip_flag
                   + (' — TP Z CORRECTED' if tp_corrected else '')),
             font=dict(size=12, color='#e8e8f0'), x=0.01),
         paper_bgcolor='#0a0a18', plot_bgcolor='#0a0a18',
@@ -1146,6 +1264,7 @@ h1{{font-family:'Syne',sans-serif;font-size:.85rem;font-weight:800;letter-spacin
 .bnl{{background:#0a1a0a;color:#55cc77;font-weight:600}}
 .bsc{{background:#1a1a3a;color:#aaaaff;font-weight:700}}
 .bcr{{background:#221010;color:#ff6633;border:1px solid #ff4400;font-weight:700}}
+.bip{{background:#001a2a;color:#00ccff;border:1px solid #0099bb;font-weight:600}}
 .tb{{display:flex;gap:5px;align-items:center;margin-left:auto;flex-wrap:wrap}}
 .tb span{{font-size:.65rem;color:var(--mu);text-transform:uppercase;letter-spacing:.04em}}
 button{{background:var(--bg);border:1px solid var(--bd);color:var(--tx);
@@ -1233,6 +1352,7 @@ button.on-focus{{background:#ff8c00;border-color:#ff8c00;color:#000;font-weight:
   {rib_badge}
   {tp_corrected_badge}
   {lstv_badge}
+  {ian_pan_badge}
   <span class="b bsc">Score: {score:.0f}</span>
   {surgical_risk_badge}
   {prob_badge}
@@ -1271,6 +1391,9 @@ button.on-focus{{background:#ff8c00;border-color:#ff8c00;color:#000;font-weight:
   <div class="li"><div class="sw" style="background:#ffe066;opacity:.9"></div>Cord</div>
   <div class="li"><div class="sw" style="background:#00ffb3;opacity:.5"></div>Canal</div>
   <div class="li"><div class="sw" style="background:#ff8800;border:1px dashed #ff8800"></div>LSTV bbox</div>
+  <div class="li"><div class="sw" style="background:#00ff88;border-radius:50%"></div>IP disc (high conf)</div>
+  <div class="li"><div class="sw" style="background:#ffcc00;border-radius:50%"></div>IP disc (med conf)</div>
+  <div class="li"><div class="sw" style="background:#ff4444;border-radius:50%"></div>IP disc (low conf)</div>
 </div>
 <div class="main-row">
   <div id="pl">{plotly_div}</div>
@@ -1327,7 +1450,8 @@ def save_html(fig, study_id: str, output_dir: Path,
               span_L: float, span_R: float, dist_L: float, dist_R: float,
               morpho: dict, cfg: dict, result: dict,
               focused_vis_json: str, full_vis_json: str,
-              tp_corrected: bool = False) -> Path:
+              tp_corrected: bool = False,
+              ian_pan_study: Optional[dict] = None) -> Path:
     from plotly.io import to_html
 
     plotly_div = to_html(fig, full_html=False, include_plotlyjs='cdn',
@@ -1404,6 +1528,19 @@ def save_html(fig, study_id: str, output_dir: Path,
         f'P({dom_class[:3]})={conf_pct:.0f}%</span>'
     ) if dom_class else ''
 
+    # Ian Pan badge
+    if ian_pan_study:
+        agr  = ian_pan_study.get("model_agreement", {})
+        sv   = agr.get("_sequence_vote", {})
+        vote = sv.get("sequence_vote", "neutral")
+        vconf= sv.get("vote_confidence", "")
+        vcol = {'H0': '#00ff88', 'H1': '#ff8800'}.get(vote, '#00ccff')
+        ian_pan_badge = (
+            f'<span class="b bip">🔵 IP:{vote} [{vconf}]</span>'
+        )
+    else:
+        ian_pan_badge = ''
+
     html = _HTML_TEMPLATE.format(
         study_id          = study_id,
         status_label      = status_cfg['label'],
@@ -1418,6 +1555,7 @@ def save_html(fig, study_id: str, output_dir: Path,
         rib_badge         = rib_badge,
         tp_corrected_badge= tp_corrected_badge,
         lstv_badge        = lstv_badge,
+        ian_pan_badge     = ian_pan_badge,
         score             = score,
         span_L            = span_L, span_R = span_R,
         tpl_c=_hc(span_L), tpr_c=_hc(span_R),
@@ -1493,7 +1631,7 @@ def rank_studies(results: List[dict],
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description='LSTV-focused 3D spine visualiser with pathology ranking')
+        description='LSTV-focused 3D spine visualiser v3.2 (with Ian Pan disc markers)')
     parser.add_argument('--spineps_dir',    required=True)
     parser.add_argument('--totalspine_dir', required=True)
     parser.add_argument('--output_dir',     required=True)
@@ -1505,6 +1643,10 @@ def main() -> int:
     parser.add_argument('--top_normal',     type=int, default=2)
     parser.add_argument('--smooth',         type=float, default=2.0)
     parser.add_argument('--no_tss',         action='store_true')
+    parser.add_argument('--ian_pan_coords', default=None,
+                        help='Path to ian_pan_disc_coords.json — enables Ian Pan '
+                             'disc peak markers on 3D renders for all five levels. '
+                             'Auto-detected from results/ian_pan_disc_coords/ if present.')
     args = parser.parse_args()
 
     spineps_dir    = Path(args.spineps_dir)
@@ -1513,6 +1655,32 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     seg_root = spineps_dir / 'segmentations'
 
+    # ── Load Ian Pan disc coords (optional) ────────────────────────────────────
+    ian_pan_lookup: Dict[str, dict] = {}
+    _default_ip = Path(args.spineps_dir).parent.parent / \
+        'results/ian_pan_disc_coords/ian_pan_disc_coords.json'
+
+    ip_path_str = args.ian_pan_coords
+    if not ip_path_str and _default_ip.exists():
+        ip_path_str = str(_default_ip)
+        logger.info(f"Auto-detected Ian Pan coords: {ip_path_str}")
+
+    if ip_path_str:
+        ip_path = Path(ip_path_str)
+        if not ip_path.exists():
+            logger.warning(f"--ian_pan_coords file not found: {ip_path}")
+        elif not _IAN_PAN_AVAILABLE:
+            logger.warning(
+                "ian_pan_disc_coords module not importable — "
+                "Ian Pan markers disabled even though --ian_pan_coords was passed")
+        else:
+            try:
+                ian_pan_lookup = load_ian_pan_disc_coords(ip_path)
+                logger.info(f"Ian Pan disc coords loaded: {len(ian_pan_lookup)} studies")
+            except Exception as exc:
+                logger.warning(f"Failed to load Ian Pan coords: {exc}")
+
+    # ── Load LSTV results ──────────────────────────────────────────────────────
     all_results: List[dict] = []
     result_by_id: Dict[str, dict] = {}
     if args.lstv_json:
@@ -1540,6 +1708,10 @@ def main() -> int:
         parser.error("--rank_by must be 'lstv' or 'all', or use --study_id / --all")
 
     logger.info(f"Rendering {len(study_ids)} studies → {output_dir}")
+    if ian_pan_lookup:
+        logger.info(f"Ian Pan markers: ENABLED ({len(ian_pan_lookup)} studies in lookup)")
+    else:
+        logger.info("Ian Pan markers: DISABLED (no --ian_pan_coords provided)")
 
     ok = 0
     for sid in study_ids:
@@ -1554,9 +1726,12 @@ def main() -> int:
                 result['pathology_score'] = compute_lstv_pathology_score(
                     result, result.get('lstv_morphometrics'))
 
+            ip_study = ian_pan_lookup.get(sid) if ian_pan_lookup else None
+
             out = build_3d_figure(
                 sid, spineps_dir, totalspine_dir, result,
                 smooth=args.smooth, show_tss=not args.no_tss,
+                ian_pan_study=ip_study,
             )
             if out is None: continue
 
@@ -1570,7 +1745,8 @@ def main() -> int:
                       castellvi, tv_name, cls_L, cls_R,
                       span_L, span_R, dist_L, dist_R, morpho, cfg, result,
                       focused_vis_json, full_vis_json,
-                      tp_corrected=tp_corrected)
+                      tp_corrected=tp_corrected,
+                      ian_pan_study=ip_study)
             ok += 1
 
         except Exception as exc:

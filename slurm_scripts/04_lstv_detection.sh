@@ -13,32 +13,37 @@
 #SBATCH -e logs/lstv_detect_%j.err
 #SBATCH --mail-user=go2432@wayne.edu
 #SBATCH --mail-type=BEGIN,END,FAIL
-
 set -euo pipefail
-
 # ── Configuration ──────────────────────────────────────────────────────────────
 ALL=true                   # true  → classify every study with SPINEPS segmentation
 STUDY_ID=""                # single study override (leave empty for batch)
 NO_MORPHO=false            # true  → skip extended lstv_engine morphometrics (faster)
+IAN_PAN_COORDS=""          # path to ian_pan_disc_coords.json — leave empty to skip
+                           # e.g. results/ian_pan_disc_coords/ian_pan_disc_coords.json
 # ─────────────────────────────────────────────────────────────────────────────
-
 echo "=============================================================="
 echo "LSTV DETECTION + MORPHOMETRICS"
 echo "ALL=$ALL  STUDY_ID=${STUDY_ID:-<batch>}  NO_MORPHO=$NO_MORPHO"
+echo "IAN_PAN_COORDS=${IAN_PAN_COORDS:-<disabled>}"
 echo "Job: $SLURM_JOB_ID  |  Start: $(date)"
 echo "=============================================================="
-
 export CONDA_PREFIX="${HOME}/mambaforge/envs/nextflow"
 export PATH="${CONDA_PREFIX}/bin:$PATH"
 unset JAVA_HOME
 export XDG_RUNTIME_DIR="${HOME}/xdr"
 export NXF_SINGULARITY_CACHEDIR="${HOME}/singularity_cache"
 mkdir -p "$XDG_RUNTIME_DIR" "$NXF_SINGULARITY_CACHEDIR" logs results/lstv_detection
-
 PROJECT_DIR="$(pwd)"
 CONTAINER="docker://go2432/spineps-preprocessing:latest"
 IMG_PATH="${NXF_SINGULARITY_CACHEDIR}/spineps-preprocessing.sif"
 [[ ! -f "$IMG_PATH" ]] && singularity pull "$IMG_PATH" "$CONTAINER"
+
+# ── Auto-detect Ian Pan coords if not explicitly set ──────────────────────────
+_DEFAULT_IAN_PAN="${PROJECT_DIR}/results/ian_pan_disc_coords/ian_pan_disc_coords.json"
+if [[ -z "$IAN_PAN_COORDS" && -f "$_DEFAULT_IAN_PAN" ]]; then
+    IAN_PAN_COORDS="$_DEFAULT_IAN_PAN"
+    echo "Auto-detected Ian Pan coords: $IAN_PAN_COORDS"
+fi
 
 ARGS=()
 if [[ -n "$STUDY_ID" ]]; then
@@ -47,6 +52,7 @@ elif [[ "$ALL" == "true" ]]; then
     ARGS+=("--all")
 fi
 [[ "$NO_MORPHO" == "true" ]] && ARGS+=("--no_morpho")
+[[ -n "$IAN_PAN_COORDS" ]] && ARGS+=("--ian_pan_coords" "/work/results/ian_pan_disc_coords/ian_pan_disc_coords.json")
 
 singularity exec \
     --bind "${PROJECT_DIR}:/work" \
@@ -60,9 +66,9 @@ singularity exec \
         --nifti_dir      /work/results/nifti \
         --output_dir     /work/results/lstv_detection \
         "${ARGS[@]}"
-
 echo "=============================================================="
 echo "Done | End: $(date)"
 echo "  results/lstv_detection/lstv_results.json"
 echo "  results/lstv_detection/lstv_summary.json"
+[[ -n "$IAN_PAN_COORDS" ]] && echo "  Ian Pan tiebreaker: ENABLED"
 echo "=============================================================="

@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# 06_visualize_3d.sh  —  LSTV 3D Visualizer with Pathology-Based Ranking
+# 06_visualize_3d.sh  —  LSTV 3D Visualizer with Pathology-Based Ranking (v3.2)
 # =============================================================================
 #SBATCH -q primary
 #SBATCH --nodes=1
@@ -24,6 +24,10 @@ TOP_N=10             # N most-pathologic studies to render
 TOP_NORMAL=1         # N most-normal studies to render (score=0)
 SMOOTH=2.0           # Gaussian sigma for marching cubes surfaces
 NO_TSS=false         # skip TotalSpineSeg label rendering
+IAN_PAN_COORDS=""    # path to ian_pan_disc_coords.json — leave empty to auto-detect
+                     # e.g. results/ian_pan_disc_coords/ian_pan_disc_coords.json
+                     # When provided, all 5 Ian Pan disc-level peaks are rendered
+                     # as coloured diamond markers on each 3D HTML (focused view).
 
 # ── Pathology score breakdown (lstv_engine.compute_lstv_pathology_score) ───────
 #
@@ -41,8 +45,9 @@ NO_TSS=false         # skip TotalSpineSeg label rendering
 # ─────────────────────────────────────────────────────────────────────────────
 
 echo "=============================================================="
-echo "LSTV 3D VISUALIZATION"
+echo "LSTV 3D VISUALIZATION (v3.2 — Ian Pan disc markers)"
 echo "RANK_BY=$RANK_BY  TOP_N=$TOP_N  TOP_NORMAL=$TOP_NORMAL  SMOOTH=$SMOOTH"
+echo "IAN_PAN_COORDS=${IAN_PAN_COORDS:-<auto-detect>}"
 echo "Job: $SLURM_JOB_ID  |  Start: $(date)"
 echo "=============================================================="
 
@@ -59,6 +64,13 @@ LSTV_JSON="${PROJECT_DIR}/results/lstv_detection/lstv_results.json"
 CONTAINER="docker://go2432/spineps-preprocessing:latest"
 IMG_PATH="${NXF_SINGULARITY_CACHEDIR}/spineps-preprocessing.sif"
 [[ ! -f "$IMG_PATH" ]] && singularity pull "$IMG_PATH" "$CONTAINER"
+
+# ── Auto-detect Ian Pan coords if not set ─────────────────────────────────────
+_DEFAULT_IAN_PAN="${PROJECT_DIR}/results/ian_pan_disc_coords/ian_pan_disc_coords.json"
+if [[ -z "$IAN_PAN_COORDS" && -f "$_DEFAULT_IAN_PAN" ]]; then
+    IAN_PAN_COORDS="$_DEFAULT_IAN_PAN"
+    echo "Auto-detected Ian Pan coords: $IAN_PAN_COORDS"
+fi
 
 # ── Pre-flight checks ──────────────────────────────────────────────────────────
 if [[ -z "$STUDY_ID" && "$RANK_BY" == "lstv" && ! -f "$LSTV_JSON" ]]; then
@@ -96,6 +108,9 @@ fi
 
 [[ "$NO_TSS" == "true" ]] && ARGS+=("--no_tss")
 
+# Ian Pan disc coords — pass container-relative path
+[[ -n "$IAN_PAN_COORDS" ]] && ARGS+=("--ian_pan_coords" "/work/results/ian_pan_disc_coords/ian_pan_disc_coords.json")
+
 # ── Run ────────────────────────────────────────────────────────────────────────
 singularity exec \
     --bind "${PROJECT_DIR}:/work" \
@@ -123,6 +138,8 @@ echo "  • Classification rationale panel"
 echo "  • Bayesian probability model"
 echo "  • Surgical relevance / wrong-level risk"
 echo "  • Dynamic clinical narrative"
+[[ -n "$IAN_PAN_COORDS" ]] && echo "  • Ian Pan disc-level peak markers (all 5 levels, coloured by confidence)"
+[[ -n "$IAN_PAN_COORDS" ]] && echo "  • Ian Pan sequence-vote summary badge (H0/H1/neutral)"
 echo "=============================================================="
 
 exit $EXIT_CODE

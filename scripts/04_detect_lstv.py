@@ -2,73 +2,55 @@
 """
 04_detect_lstv.py — Hybrid Two-Phase LSTV Castellvi Classifier
 ===============================================================
-v4.2  (ALIGNMENT ENSEMBLE EDITION)
------------------------------------
+v4.4  (IAN PAN VERTEBRAL ARBITRATION EDITION)
+----------------------------------------------
 
-NEW IN v4.2
+NEW IN v4.4
 -----------
-VERTEBRAL ALIGNMENT ENSEMBLE ANALYSIS
-  Every study now runs a rigorous sequence-level Dice alignment test between
-  TSS and VERIDAH (SPINEPS seg-vert_msk) labels BEFORE classification.
-  Two hypotheses are evaluated across the entire lumbar vertebral sequence:
+IAN PAN VERTEBRAL BODY ARBITRATION
+  Ian Pan's disc-level confidence predictions now act as a first-class
+  arbitrator whenever TotalSpineSeg (TSS) and VERIDAH (SPINEPS seg-vert_msk)
+  disagree on vertebral level identity (Dice offset != 0).
 
-    H0 (ALIGNED): VD_Lk ↔ TSS_Lk for k = 1..5
-        VD L1=TSS L1, VD L2=TSS L2, ... VD L5=TSS L5
-        (normal anatomy or true sacralization)
+  When offset == 0 (both models agree): Ian Pan is informational only —
+  its scores are logged and stored but preferred_hypothesis is not changed.
 
-    H1 (SHIFTED): VD_Lk ↔ TSS_L(k+1) — VERIDAH is one level below TSS
-        VD L1=TSS L2, VD L2=TSS L3, VD L3=TSS L4,
-        VD L4=TSS L5, VD L5=TSS sacrum-superior
-        (indicates VERIDAH labelled an extra caudal segment that TSS
-        incorporated into its sacrum — likely true lumbarization, but
-        ground truth required for certainty)
+  When offset != 0 (models disagree): Ian Pan arbitrates by inferring
+  vertebral body positions from adjacent disc midpoints and scoring each
+  segmentation model by proximity in RAS mm space.
 
-  The preferred hypothesis is the one with the higher mean Dice across ALL
-  vertebral pairs (minimum 3 pairs, minimum 8 pp margin for H1 to overturn
-  the default TSS-aligned interpretation). This is not a magnitude threshold
-  — it is a whole-sequence comparison that can only declare an off-by-one
-  when the ENTIRE labelling sequence shifts coherently.
+  VERTEBRAL BODY INFERENCE
+  For each adjacent disc pair where both peaks meet SEQ_VOTE_MIN_PROB (0.30):
+    inferred_body_RAS = midpoint(world_ras_mm[disc_above],
+                                  world_ras_mm[disc_below])
 
-  The study is then classified under BOTH hypotheses and both Castellvi
-  types / phenotypes are reported. The preferred hypothesis drives the
-  primary output fields (castellvi_type, lstv_phenotype) while the
-  alternative classification is preserved for ensemble reporting.
+  This gives four inferred vertebral body positions:
+    L2 = midpoint(L1/L2 peak, L2/L3 peak)
+    L3 = midpoint(L2/L3 peak, L3/L4 peak)
+    L4 = midpoint(L3/L4 peak, L4/L5 peak)
+    L5 = midpoint(L4/L5 peak, L5/S1 peak)
 
-FREQUENCY REPORTING
-  The final summary logs and CSV include:
-    • n_studies with VD L6 present
-    • n_studies where H1 (off-by-one) was accepted vs rejected
-    • L6 false-positive rate (VD L6 present but H1 rejected)
-    • Mean alignment scores H0 and H1 across the cohort
-    • N studies where classification CHANGES between hypotheses
-    • Per-study Dice matrix for every vertebral pair under both hypotheses
+  SCORING
+    score_TSS    = mean dist(inferred_body_k, TSS_vert_k_centroid_RAS)
+    score_VERI   = mean dist(inferred_body_k, VERIDAH_vert_k_centroid_RAS)
+    margin_mm    = score_VERI - score_TSS
+      > 0  =>  TSS centroids are closer  =>  TSS labeling is anatomically correct
+      < 0  =>  VERIDAH centroids are closer  =>  VERIDAH labeling is correct
 
-CSV OUTPUTS (via lstv_csv_reporter.py)
-  • lstv_per_study.csv      — all classification + alignment fields (1 row/study)
-  • lstv_alignment.csv      — alignment-focused table (1 row/study)
-  • lstv_l6_subgroup.csv    — subset: only studies where VERIDAH found L6
-  • lstv_cohort_summary.csv — single-row aggregated cohort statistics
-  • lstv_results.json       — full JSON (unchanged)
-  • lstv_summary.json       — cohort summary JSON (unchanged)
+  OVERRIDE POLICY
+    offset != 0 and n_pairs >= IP_MIN_VERT_PAIRS (2) and
+    |margin_mm| >= IP_VERT_MIN_MARGIN_MM (5.0 mm):
+      TSS wins     => preferred_hypothesis = 'aligned'
+      VERIDAH wins => 'shifted_plus_1' (offset > 0) or 'shifted_minus_1' (offset < 0)
 
-FUTURE EXTENSIBILITY
-  The AlignmentResult.ground_truth_label / ground_truth_method fields are
-  reserved for prospective annotation. The intended pipeline is:
-    1. Radiologist annotates using axial nerve morphology (L4/L5/S1 root
-       calibre at sacral foramina) — most reliable non-full-spine method.
-    2. Iliolumbar ligament origin landmark as secondary confirmation.
-    3. Full-spine scout (C2 counting) when available.
-    4. Annotations drive YOLO/CNN training on the alignment task directly.
+  All Ian Pan fields stored on AlignmentResult and written to lstv_alignment.csv
+  regardless of whether an override fires.
 
-CHANGES FROM v4.1
-  • classify_study() now calls analyse_vertebral_alignment() and stores
-    the result in out['alignment']
-  • classify_study_under_hypothesis() runs Phase 1+2 under a given TV label
-    override (used for H1 ensemble classification)
-  • main() calls write_csv_reports() from lstv_csv_reporter.py
-  • Cohort summary extended with alignment statistics
-  • All other logic (TSS-first TV selection, L6 verification, segmental axis,
-    Phase 1/2 classification) is identical to v4.1
+  The legacy disc-vs-disc sequence vote fields are preserved for auditability.
+
+USAGE
+  Pass --ian_pan_coords path/to/ian_pan_disc_coords.json to enable.
+  No JSON regeneration needed — uses the existing world_ras_mm field.
 """
 
 from __future__ import annotations
@@ -99,6 +81,12 @@ from vertebral_alignment import (
     AlignmentResult, CohortAlignmentStats,
 )
 from lstv_csv_reporter import write_csv_reports
+
+try:
+    from ian_pan_disc_coords import load_ian_pan_disc_coords
+    _IAN_PAN_AVAILABLE = True
+except ImportError:
+    _IAN_PAN_AVAILABLE = False
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s  %(levelname)-7s  %(message)s')
@@ -143,10 +131,38 @@ TV_TO_VD_FALLBACK: Dict[int, Tuple[Optional[int], Optional[int]]] = {
 
 TSS_VERT_TO_VD: Dict[int, int] = {v: k for k, v in VD_TO_TSS_VERT.items()}
 
+# ── Ian Pan arbitration constants ─────────────────────────────────────────────
+DISC_NAMES            = ["l1_l2", "l2_l3", "l3_l4", "l4_l5", "l5_s1"]
+SEQ_VOTE_MIN_PROB     = 0.30   # minimum peak_prob for a disc to contribute
+IP_VERT_MIN_MARGIN_MM = 5.0    # Ian Pan must beat other model by this to arbitrate
+IP_MIN_VERT_PAIRS     = 2      # minimum inferred vertebral body pairs required
+
+# (disc_above, disc_below) -> (vert_name, TSS_label, VERIDAH_label)
+# The body between two adjacent discs is approximated by their midpoint.
+#   TSS labels:     41=L1  42=L2  43=L3  44=L4  45=L5
+#   VERIDAH labels: 20=L1  21=L2  22=L3  23=L4  24=L5  25=L6
+IP_DISC_PAIR_TO_VERT: Dict[Tuple[str, str], Tuple[str, int, int]] = {
+    ("l1_l2", "l2_l3"): ("L2", 42, 21),
+    ("l2_l3", "l3_l4"): ("L3", 43, 22),
+    ("l3_l4", "l4_l5"): ("L4", 44, 23),
+    ("l4_l5", "l5_s1"): ("L5", 45, 24),
+}
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NIfTI HELPERS  (identical to v4.1)
+# NIfTI HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
+
+def _ras_centroid(data: np.ndarray, label: int,
+                  affine: np.ndarray) -> Optional[np.ndarray]:
+    """RAS-mm centroid of all voxels with the given integer label, or None."""
+    mask = (data == label)
+    if not mask.any():
+        return None
+    idx = np.array(np.where(mask), dtype=np.float64).mean(axis=1)  # (3,) ijk
+    ras = affine[:3, :3] @ idx + affine[:3, 3]
+    return ras
+
 
 def load_canonical(path: Path) -> Tuple[np.ndarray, nib.Nifti1Image]:
     nii  = nib.load(str(path))
@@ -166,7 +182,7 @@ def voxel_size_mm(nii: nib.Nifti1Image) -> np.ndarray:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CROSS-VALIDATION  (identical to v4.1)
+# CROSS-VALIDATION
 # ══════════════════════════════════════════════════════════════════════════════
 
 def dice_coefficient(a: np.ndarray, b: np.ndarray) -> float:
@@ -215,7 +231,7 @@ def run_cross_validation(sag_spineps, sag_vert, sag_tss, vox_mm, study_id):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MASK OPERATIONS  (identical to v4.1)
+# MASK OPERATIONS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_z_range_from_mask(mask: np.ndarray) -> Optional[Tuple[int, int]]:
@@ -275,7 +291,7 @@ def min_dist_3d(mask_a, mask_b, vox_mm):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TV Z-RANGE  (identical to v4.1)
+# TV Z-RANGE
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_tv_z_range(sag_vert, sag_tss, tv_label, study_id):
@@ -302,7 +318,7 @@ def get_tv_z_range(sag_vert, sag_tss, tv_label, study_id):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SEGMENTAL AXIS  (identical to v4.1)
+# SEGMENTAL AXIS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _mask_centroid_mm(mask, vox_mm):
@@ -354,7 +370,7 @@ def compute_segmental_axis(sag_tss, sag_vert, tv_label, vox_mm, study_id):
         return np.array([0., 0., 1.]), 'scanner Z axis (fallback)'
 
     if 'VERIDAH' in sup_src or 'VERIDAH' in inf_src:
-        logger.warning(f"  [{study_id}] Segmental axis using VERIDAH ref ({sup_src} ↔ {inf_src})")
+        logger.warning(f"  [{study_id}] Segmental axis using VERIDAH ref ({sup_src} <-> {inf_src})")
 
     raw  = sup_pt - inf_pt
     norm = float(np.linalg.norm(raw))
@@ -362,14 +378,14 @@ def compute_segmental_axis(sag_tss, sag_vert, tv_label, vox_mm, study_id):
         return np.array([0., 0., 1.]), 'scanner Z axis (degenerate centroids)'
 
     unit = raw / norm
-    src  = f'{inf_src} → {sup_src}'
+    src  = f'{inf_src} -> {sup_src}'
     logger.info(f"  [{study_id}] Segmental SI axis: {src}  "
                 f"v=[{unit[0]:.3f},{unit[1]:.3f},{unit[2]:.3f}]")
     return unit, src
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TP HEIGHT  (identical to v4.1)
+# TP HEIGHT
 # ══════════════════════════════════════════════════════════════════════════════
 
 def measure_tp_height_principal_axis(tp_mask, vox_mm, segmental_axis):
@@ -398,7 +414,7 @@ def measure_tp_height_principal_axis(tp_mask, vox_mm, segmental_axis):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# L6 VERIFICATION  (identical to v4.1)
+# L6 VERIFICATION
 # ══════════════════════════════════════════════════════════════════════════════
 
 TSS_DISC_LABELS = set(range(91, 101))
@@ -415,11 +431,11 @@ def _verify_l6(sag_vert, sag_tss, vox_mm, tv_z, study_id):
         return False, "TSS sacrum (label 50) absent"
     sac_z_sup = float(np.where(tss_sac)[2].max())
     if l6_centroid_z <= sac_z_sup:
-        return False, f"L6 centroid z={l6_centroid_z:.0f} ≤ TSS sacrum sup z={sac_z_sup:.0f}"
+        return False, f"L6 centroid z={l6_centroid_z:.0f} <= TSS sacrum sup z={sac_z_sup:.0f}"
     if tss_l5.any():
         l5_z_min = float(np.where(tss_l5)[2].min())
         if l6_centroid_z >= l5_z_min:
-            return False, f"L6 centroid z={l6_centroid_z:.0f} ≥ TSS L5 inf z={l5_z_min:.0f}"
+            return False, f"L6 centroid z={l6_centroid_z:.0f} >= TSS L5 inf z={l5_z_min:.0f}"
     disc_above_z = disc_below_z = None
     for disc_lbl in TSS_DISC_LABELS:
         disc_mask = (sag_tss == disc_lbl)
@@ -438,7 +454,7 @@ def _verify_l6(sag_vert, sag_tss, vox_mm, tv_z, study_id):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 2  (identical to v4.1)
+# PHASE 2
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _extract_bbox(axial_t2w, midpoint, half=BBOX_HALF):
@@ -464,10 +480,10 @@ def _classify_signal(patch, axial_t2w):
                'coeff_var': round(cv,4), 'global_p95': round(p95,2),
                'dark_thresh': round(dark_thr,2), 'valid': True}
     if p_mean < dark_thr:
-        feats['reason'] = f"mean={p_mean:.1f} < dark_thr={dark_thr:.1f} → Type II"
+        feats['reason'] = f"mean={p_mean:.1f} < dark_thr={dark_thr:.1f} -> Type II"
         return 'Type II', feats
     elif cv < P2_MIN_STD_RATIO:
-        feats['reason'] = f"CV={cv:.3f} < {P2_MIN_STD_RATIO} — uniform bright → Type III"
+        feats['reason'] = f"CV={cv:.3f} < {P2_MIN_STD_RATIO} — uniform bright -> Type III"
         return 'Type III', feats
     else:
         feats['reason'] = "Bright heterogeneous — ambiguous; Type II (conservative)"
@@ -504,7 +520,7 @@ def phase2_axial(side, tp_label, ax_spineps, ax_tss, ax_t2w, ax_vox_mm):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 1  (identical to v4.1)
+# PHASE 1
 # ══════════════════════════════════════════════════════════════════════════════
 
 def phase1_sagittal(side, tp_label, sag_sp, sag_tss, sag_vox_mm,
@@ -566,18 +582,13 @@ def phase1_sagittal(side, tp_label, sag_sp, sag_tss, sag_vox_mm,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CASTELLVI TYPE FINALISER  (shared logic, extracted for ensemble re-use)
+# CASTELLVI TYPE FINALISER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def finalise_castellvi(left_result: dict, right_result: dict,
                         p2_available: bool,
                         ax_sp, ax_tss, ax_t2w, ax_vox_mm,
                         confidence_ref: List[str]) -> Tuple[Optional[str], dict, dict]:
-    """
-    Given per-side phase-1 results, apply phase-2 if needed and return
-    (castellvi_type, left_result, right_result).
-    confidence_ref is a mutable 1-element list used to propagate 'low' confidence.
-    """
     RANK = {'Type I': 1, 'Type II': 2, 'Type III': 3, 'Type IV': 4}
 
     for side, p1, tp_lbl in (('left',  left_result,  SP_TP_L),
@@ -610,6 +621,232 @@ def finalise_castellvi(left_result: dict, right_result: dict,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# IAN PAN VERTEBRAL ARBITRATION  (v4.4)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def apply_ian_pan_tiebreaker(
+    alignment_result: AlignmentResult,
+    ian_pan_study: dict,
+    study_id: str,
+    tss_vert_centroids_ras: dict,
+    vd_vert_centroids_ras:  dict,
+) -> None:
+    """
+    Infers vertebral body positions from Ian Pan disc peak midpoints
+    (world_ras_mm) and scores TSS vs VERIDAH labeling by proximity in RAS mm.
+
+    offset == 0: informational only, no override.
+    offset != 0: arbitrates when n_pairs >= IP_MIN_VERT_PAIRS and
+                 |margin_mm| >= IP_VERT_MIN_MARGIN_MM.
+
+    Fields written on AlignmentResult (always):
+      ip_score_tss_mm, ip_score_vd_mm, ip_vert_margin_mm,
+      ip_n_vert_pairs, ip_winner, ip_inferred_verts, ip_tiebreak_applied,
+      + legacy disc-level fields (ip_sequence_vote, ip_per_level, etc.)
+    """
+    if not ian_pan_study:
+        return
+
+    agr = ian_pan_study.get("model_agreement", {})
+    sv  = agr.get("_sequence_vote", {})
+
+    # ── Extract disc peak positions ───────────────────────────────────────────
+    disc_peaks_ras: Dict = {}
+    disc_probs:     Dict = {}
+    for disc in DISC_NAMES:
+        d_lv  = ian_pan_study.get("disc_levels", {}).get(disc, {})
+        prob  = float(d_lv.get("peak_prob", 0.0) or 0.0)
+        disc_probs[disc] = prob
+        coord = d_lv.get("world_ras_mm")
+        if coord is not None and prob >= SEQ_VOTE_MIN_PROB:
+            disc_peaks_ras[disc] = np.array(coord, dtype=float)
+        else:
+            disc_peaks_ras[disc] = None
+
+    # ── Infer vertebral body positions ────────────────────────────────────────
+    ip_inferred_verts: Dict = {}
+
+    for (disc_above, disc_below), (vert_name, tss_lbl, vd_lbl) in IP_DISC_PAIR_TO_VERT.items():
+        pos_a  = disc_peaks_ras.get(disc_above)
+        pos_b  = disc_peaks_ras.get(disc_below)
+        prob_a = disc_probs.get(disc_above, 0.0)
+        prob_b = disc_probs.get(disc_below, 0.0)
+
+        if pos_a is None or pos_b is None:
+            ip_inferred_verts[vert_name] = {
+                "voted":            False,
+                "inferred_pos_ras": None,
+                "tss_label":        tss_lbl,
+                "vd_label":         vd_lbl,
+                "dist_tss_mm":      None,
+                "dist_vd_mm":       None,
+                "prob_disc_above":  round(prob_a, 3),
+                "prob_disc_below":  round(prob_b, 3),
+                "skip_reason":      (f"p_above={prob_a:.2f}" if pos_a is None
+                                     else f"p_below={prob_b:.2f}") + " < threshold",
+            }
+            continue
+
+        inferred_pos = (pos_a + pos_b) / 2.0
+        tss_ctr = tss_vert_centroids_ras.get(tss_lbl)
+        vd_ctr  = vd_vert_centroids_ras.get(vd_lbl)
+
+        dist_tss = float(np.linalg.norm(inferred_pos - tss_ctr)) if tss_ctr is not None else None
+        dist_vd  = float(np.linalg.norm(inferred_pos - vd_ctr))  if vd_ctr  is not None else None
+
+        ip_inferred_verts[vert_name] = {
+            "voted":            True,
+            "inferred_pos_ras": inferred_pos.tolist(),
+            "tss_label":        tss_lbl,
+            "vd_label":         vd_lbl,
+            "dist_tss_mm":      round(dist_tss, 2) if dist_tss is not None else None,
+            "dist_vd_mm":       round(dist_vd,  2) if dist_vd  is not None else None,
+            "prob_disc_above":  round(prob_a, 3),
+            "prob_disc_below":  round(prob_b, 3),
+            "closer_model":     ("TSS"     if (dist_tss is not None and dist_vd is not None
+                                               and dist_tss <= dist_vd)
+                                 else "VERIDAH" if (dist_tss is not None and dist_vd is not None)
+                                 else None),
+        }
+
+    # ── Aggregate scores ──────────────────────────────────────────────────────
+    tss_dists = [v["dist_tss_mm"] for v in ip_inferred_verts.values()
+                 if v["voted"] and v["dist_tss_mm"] is not None]
+    vd_dists  = [v["dist_vd_mm"]  for v in ip_inferred_verts.values()
+                 if v["voted"] and v["dist_vd_mm"]  is not None]
+
+    n_pairs   = min(len(tss_dists), len(vd_dists))
+    score_tss = float(np.mean(tss_dists)) if tss_dists else None
+    score_vd  = float(np.mean(vd_dists))  if vd_dists  else None
+
+    if score_tss is not None and score_vd is not None:
+        margin_mm = score_vd - score_tss   # +ve = TSS closer
+        if   margin_mm >  1e-3: ip_winner = "TSS"
+        elif margin_mm < -1e-3: ip_winner = "VERIDAH"
+        else:                   ip_winner = "tie"
+    else:
+        margin_mm = None
+        ip_winner = "insufficient"
+
+    # ── Legacy disc-vs-disc fields (preserved) ────────────────────────────────
+    ip_vote   = sv.get("sequence_vote",   "neutral")
+    ip_conf   = sv.get("vote_confidence", "insufficient")
+    ip_margin = float(sv.get("margin_mm", 0.0) or 0.0)
+    ip_h0     = sv.get("mean_dist_h0_mm")
+    ip_h1     = sv.get("mean_dist_h1_mm")
+    ip_n      = sv.get("n_levels_voted",  0)
+
+    per_level: Dict = {}
+    for disc_name in DISC_NAMES:
+        d_ag = agr.get(disc_name, {})
+        d_lv = ian_pan_study.get("disc_levels", {}).get(disc_name, {})
+        d0   = d_ag.get("dist_to_tss_h0_mm")
+        d1   = d_ag.get("dist_to_tss_h1_mm")
+        per_level[disc_name] = {
+            "peak_prob":  d_lv.get("peak_prob"),
+            "entropy":    d_lv.get("entropy"),
+            "dist_h0_mm": d0,
+            "dist_h1_mm": d1,
+            "closer_hyp": ("H0" if (d0 is not None and d1 is not None and d0 <= d1)
+                           else "H1" if (d0 is not None and d1 is not None)
+                           else None),
+        }
+
+    # ── Attach all fields unconditionally ─────────────────────────────────────
+    alignment_result.ip_sequence_vote    = ip_vote
+    alignment_result.ip_vote_confidence  = ip_conf
+    alignment_result.ip_seq_margin_mm    = round(ip_margin, 2)
+    alignment_result.ip_mean_dist_h0_mm  = ip_h0
+    alignment_result.ip_mean_dist_h1_mm  = ip_h1
+    alignment_result.ip_n_levels_voted   = ip_n
+    alignment_result.ip_per_level        = per_level
+    alignment_result.ip_tiebreak_applied = False
+    alignment_result.ip_score_tss_mm     = round(score_tss, 2) if score_tss is not None else None
+    alignment_result.ip_score_vd_mm      = round(score_vd,  2) if score_vd  is not None else None
+    alignment_result.ip_vert_margin_mm   = round(margin_mm, 2) if margin_mm is not None else None
+    alignment_result.ip_n_vert_pairs     = n_pairs
+    alignment_result.ip_winner           = ip_winner
+    alignment_result.ip_inferred_verts   = ip_inferred_verts
+
+    offset = getattr(alignment_result, "best_offset", 0) or 0
+
+    # ── Logging ────────────────────────────────────────────────────────────────
+    if score_tss is not None and score_vd is not None:
+        logger.info(
+            f"  [{study_id}] Ian Pan vertebral scoring: "
+            f"TSS={score_tss:.1f}mm  VERIDAH={score_vd:.1f}mm  "
+            f"margin={margin_mm:+.1f}mm -> winner={ip_winner}  "
+            f"n={n_pairs} pairs  offset={offset:+d}"
+        )
+    else:
+        logger.info(
+            f"  [{study_id}] Ian Pan vertebral scoring: INSUFFICIENT DATA  "
+            f"n_pairs={n_pairs}  offset={offset:+d}"
+        )
+
+    for vert_name, vd in ip_inferred_verts.items():
+        if vd["voted"]:
+            dt   = vd["dist_tss_mm"]
+            dv   = vd["dist_vd_mm"]
+            flag = "TSS" if vd["closer_model"] == "TSS" else "VD"
+            logger.info(
+                f"    {vert_name}: "
+                f"TSS(lbl={vd['tss_label']})={dt:.1f}mm  "
+                f"VD(lbl={vd['vd_label']})={dv:.1f}mm  "
+                f"-> {flag} closer  "
+                f"[p_above={vd['prob_disc_above']:.2f} p_below={vd['prob_disc_below']:.2f}]"
+            )
+        else:
+            logger.info(
+                f"    {vert_name}: SKIPPED — {vd.get('skip_reason', 'below threshold')}"
+            )
+
+    # ── Override decision ──────────────────────────────────────────────────────
+    if offset == 0:
+        logger.info(
+            f"  [{study_id}] Ian Pan: models agree (offset=0) — "
+            f"informational only, no override  "
+            f"[TSS={score_tss}mm  VERIDAH={score_vd}mm]"
+        )
+        return
+
+    if n_pairs < IP_MIN_VERT_PAIRS:
+        logger.info(
+            f"  [{study_id}] Ian Pan arbitration SKIPPED: "
+            f"n_pairs={n_pairs} < {IP_MIN_VERT_PAIRS} required  (offset={offset:+d})"
+        )
+        return
+
+    if margin_mm is None or abs(margin_mm) < IP_VERT_MIN_MARGIN_MM:
+        margin_str = f"{margin_mm:.1f}mm" if margin_mm is not None else "N/A"
+        logger.info(
+            f"  [{study_id}] Ian Pan arbitration SKIPPED: "
+            f"|margin|={margin_str} < {IP_VERT_MIN_MARGIN_MM}mm — ambiguous  "
+            f"(offset={offset:+d})"
+        )
+        return
+
+    old_hyp = alignment_result.preferred_hypothesis
+
+    if ip_winner == "TSS":
+        new_hyp = "aligned"
+    elif offset > 0:
+        new_hyp = "shifted_plus_1"
+    else:
+        new_hyp = "shifted_minus_1"
+
+    alignment_result.preferred_hypothesis = new_hyp
+    alignment_result.confidence           = "moderate"
+    alignment_result.ip_tiebreak_applied  = True
+
+    logger.info(
+        f"  [{study_id}] !! Ian Pan ARBITRATION: {old_hyp} -> {new_hyp}  "
+        f"[winner={ip_winner}  TSS={score_tss:.1f}mm  VERIDAH={score_vd:.1f}mm  "
+        f"margin={margin_mm:+.1f}mm  n={n_pairs} pairs  offset={offset:+d}]"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # PER-STUDY CLASSIFIER
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -618,15 +855,9 @@ def classify_study(study_id:       str,
                    totalspine_dir: Path,
                    registered_dir: Path,
                    nifti_dir:      Path,
-                   run_morpho:     bool = True) -> Tuple[dict, Optional[AlignmentResult]]:
-    """
-    Full LSTV classification for one study.
-
-    Returns
-    -------
-    (result_dict, AlignmentResult)
-    AlignmentResult is None if the alignment analysis could not be run.
-    """
+                   run_morpho:     bool = True,
+                   ian_pan_study:  Optional[dict] = None,
+                   ) -> Tuple[dict, Optional[AlignmentResult]]:
     out: dict = {
         'study_id':           study_id,
         'lstv_detected':      False,
@@ -639,7 +870,7 @@ def classify_study(study_id:       str,
         'cross_validation':   {},
         'lstv_morphometrics': None,
         'pathology_score':    None,
-        'alignment':          None,   # ← new v4.2
+        'alignment':          None,
         'errors':             [],
     }
 
@@ -668,9 +899,9 @@ def classify_study(study_id:       str,
             if p.exists(): return p
         return None
 
-    sag_sp,  sp_nii  = _load(spine_path, 'seg-spine_msk')
-    sag_vert, _      = _load(vert_path,  'seg-vert_msk')
-    sag_tss,  _      = _load(tss_sag,    'TSS sagittal')
+    sag_sp,   sp_nii   = _load(spine_path, 'seg-spine_msk')
+    sag_vert, vert_nii = _load(vert_path,  'seg-vert_msk')
+    sag_tss,  tss_nii  = _load(tss_sag,    'TSS sagittal')
 
     if sag_sp   is None: out['errors'].append('Missing SPINEPS seg-spine_msk'); return out, None
     if sag_vert is None: out['errors'].append('Missing SPINEPS seg-vert_msk');  return out, None
@@ -681,8 +912,23 @@ def classify_study(study_id:       str,
     sag_tss  = sag_tss.astype(int)
     vox_mm   = voxel_size_mm(sp_nii)
 
+    # ── Pre-compute RAS centroids for Ian Pan vertebral scoring ───────────────
+    tss_vert_centroids_ras: Dict[int, Optional[np.ndarray]] = {
+        lbl: _ras_centroid(sag_tss,  lbl, tss_nii.affine)
+        for lbl in (41, 42, 43, 44, 45)
+    }
+    vd_vert_centroids_ras: Dict[int, Optional[np.ndarray]] = {
+        lbl: _ras_centroid(sag_vert, lbl, vert_nii.affine)
+        for lbl in (20, 21, 22, 23, 24, 25)
+    }
+    logger.info(
+        f"  [{study_id}] RAS centroids: "
+        f"TSS={sum(1 for v in tss_vert_centroids_ras.values() if v is not None)}/5  "
+        f"VERIDAH={sum(1 for v in vd_vert_centroids_ras.values() if v is not None)}/6"
+    )
+
     # ══════════════════════════════════════════════════════════════════════════
-    # ALIGNMENT ANALYSIS  (NEW v4.2)
+    # ALIGNMENT ANALYSIS
     # ══════════════════════════════════════════════════════════════════════════
     alignment_result: Optional[AlignmentResult] = None
     try:
@@ -691,6 +937,18 @@ def classify_study(study_id:       str,
     except Exception as exc:
         logger.error(f"  [{study_id}] Alignment analysis failed: {exc}")
         out['errors'].append(f'alignment: {exc}')
+
+    # ── Ian Pan vertebral arbitration ─────────────────────────────────────────
+    if ian_pan_study is not None and alignment_result is not None:
+        try:
+            apply_ian_pan_tiebreaker(
+                alignment_result, ian_pan_study, study_id,
+                tss_vert_centroids_ras, vd_vert_centroids_ras,
+            )
+            out['alignment'] = alignment_result.to_dict()
+        except Exception as exc:
+            logger.error(f"  [{study_id}] Ian Pan arbitration failed: {exc}")
+            out['errors'].append(f'ian_pan_arbitration: {exc}')
 
     # ── TSS label logging ──────────────────────────────────────────────────────
     tss_unique         = sorted(int(v) for v in np.unique(sag_tss) if v > 0)
@@ -702,7 +960,7 @@ def classify_study(study_id:       str,
     tss_highest_lumbar  = max((lbl for lbl in TSS_LUMBAR if lbl in tss_unique), default=None)
     tss_preferred_tv_vd = TSS_VERT_TO_VD.get(tss_highest_lumbar)
     vert_unique         = sorted(int(v) for v in np.unique(sag_vert) if v > 0)
-    logger.info(f"  [{study_id}] TSS TV preference: TSS {tss_highest_lumbar} → "
+    logger.info(f"  [{study_id}] TSS TV preference: TSS {tss_highest_lumbar} -> "
                 f"VERIDAH {tss_preferred_tv_vd} "
                 f"({'present' if tss_preferred_tv_vd in vert_unique else 'ABSENT'})")
 
@@ -724,13 +982,13 @@ def classify_study(study_id:       str,
 
     p2_available = (ax_tss is not None and ax_sp is not None and ax_t2w is not None)
     if not p2_available:
-        logger.warning(f"  Phase 2 unavailable — contact cases → Type II")
+        logger.warning(f"  Phase 2 unavailable — contact cases -> Type II")
 
     if ax_tss is not None: ax_tss = ax_tss.astype(int)
     if ax_sp  is not None: ax_sp  = ax_sp.astype(int)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # TV IDENTIFICATION — TSS-first (identical to v4.1)
+    # TV IDENTIFICATION — TSS-first
     # ══════════════════════════════════════════════════════════════════════════
     named = [VERIDAH_NAMES[l] for l in vert_unique if l in VERIDAH_NAMES]
     logger.info(f"  [{study_id}] VERIDAH labels: {named}")
@@ -741,7 +999,7 @@ def classify_study(study_id:       str,
         tv_label = tss_preferred_tv_vd
         tv_name  = VERIDAH_NAMES[tv_label]
         logger.info(f"  [{study_id}] TV via TSS GT: {tv_name} "
-                    f"(VD {tv_label} ← TSS {tss_highest_lumbar})")
+                    f"(VD {tv_label} <- TSS {tss_highest_lumbar})")
     elif VD_L6 in vert_unique:
         tv_label = VD_L6; tv_name = VERIDAH_NAMES[VD_L6]
         logger.info(f"  [{study_id}] TV: VERIDAH L6 present — will verify")
@@ -774,7 +1032,7 @@ def classify_study(study_id:       str,
                 out['errors'].append('L6 failed and no L5 fallback')
                 return out, alignment_result
         else:
-            logger.info(f"  [{study_id}] VERIDAH L6 verified ✓ — {l6_reason}")
+            logger.info(f"  [{study_id}] VERIDAH L6 verified -- {l6_reason}")
 
     # ── TV Z-range + segmental axis ────────────────────────────────────────────
     tv_z, tv_z_src = get_tv_z_range(sag_vert, sag_tss, tv_label, study_id)
@@ -792,13 +1050,13 @@ def classify_study(study_id:       str,
         'segmental_axis_source': seg_src,
         'sag_vox_mm': vox_mm.tolist(), 'phase2_available': p2_available,
         'tss_lumbar_labels': tss_lumbar_present,
-        'tss_tv_preference': f'TSS {tss_highest_lumbar} → VERIDAH {tss_preferred_tv_vd}',
+        'tss_tv_preference': f'TSS {tss_highest_lumbar} -> VERIDAH {tss_preferred_tv_vd}',
         'alignment_hypothesis': (alignment_result.preferred_hypothesis
                                   if alignment_result else 'not_computed'),
     }
 
     # ══════════════════════════════════════════════════════════════════════════
-    # PHASE 1 + 2 — PRIMARY (H0/preferred) CLASSIFICATION
+    # PHASE 1 + 2
     # ══════════════════════════════════════════════════════════════════════════
     confidence_ref = [out['confidence']]
 
@@ -808,7 +1066,7 @@ def classify_study(study_id:       str,
                                   tv_z, seg_axis, seg_src)
             logger.info(f"  {side:5s} P1: {p1['classification']:22s} "
                         f"h={p1['tp_height_mm']:.1f}mm  d={p1['dist_mm']:.1f}mm  "
-                        f"|cosθ|={p1.get('tp_axis_cos_segmental','?')}  "
+                        f"|cosT|={p1.get('tp_axis_cos_segmental','?')}  "
                         f"z=[{p1.get('tp_z_min_vox','?')},{p1.get('tp_z_max_vox','?')}]")
             out[side] = p1
         except Exception as exc:
@@ -825,23 +1083,18 @@ def classify_study(study_id:       str,
         out['castellvi_type']  = ct
         out['lstv_detected']   = True
         out['lstv_reason'].append(f"Castellvi {ct} — TP morphology")
-        logger.info(f"  ✓ [{study_id}] Castellvi (H0): {ct}")
+        logger.info(f"  + [{study_id}] Castellvi (H0): {ct}")
     else:
-        logger.info(f"  ✗ [{study_id}] No Castellvi (H0)")
+        logger.info(f"  - [{study_id}] No Castellvi (H0)")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # ENSEMBLE CLASSIFICATION  (v4.3 — generalised offset model)
-    # Always store the primary ("at_zero") result on AlignmentResult.
-    # When best_offset != 0, also run classification under the offset hypothesis
-    # using the TV implied by that offset, and store as "at_best".
+    # ENSEMBLE CLASSIFICATION
     # ══════════════════════════════════════════════════════════════════════════
     if alignment_result is not None:
-        # Store primary classification as "at_zero" (TSS-guided TV = offset=0)
         alignment_result.castellvi_at_zero    = out.get('castellvi_type')
         alignment_result.lstv_detected_at_zero = out.get('lstv_detected', False)
-        alignment_result.phenotype_at_zero    = None   # filled after morpho below
+        alignment_result.phenotype_at_zero    = None
 
-        # Run alternative classification only when offset disagrees
         if alignment_result.best_offset is not None and alignment_result.best_offset != 0:
             try:
                 _run_ensemble_offset(
@@ -886,20 +1139,17 @@ def classify_study(study_id:       str,
                 if not any('Phenotype' in r for r in out['lstv_reason']):
                     out['lstv_reason'].append(reason)
 
-            # ── Back-fill alignment result with phenotype ─────────────────────
             if alignment_result is not None:
                 alignment_result.phenotype_at_zero    = phenotype
                 alignment_result.lstv_detected_at_zero = out.get('lstv_detected', False)
                 if alignment_result.castellvi_at_zero is None:
                     alignment_result.castellvi_at_zero = out.get('castellvi_type')
-                # Update serialised copy
                 out['alignment'] = alignment_result.to_dict()
 
         except Exception as exc:
             logger.error(f"  [{study_id}] lstv_engine error: {exc}")
             out['errors'].append(f'lstv_engine: {exc}')
 
-    # ── Pathology score ────────────────────────────────────────────────────────
     out['pathology_score'] = compute_lstv_pathology_score(
         out, out.get('lstv_morphometrics'))
 
@@ -908,9 +1158,16 @@ def classify_study(study_id:       str,
     probs_dict  = (morpho_dict.get('probabilities') or {})
     sr_dict     = (morpho_dict.get('surgical_relevance') or {})
 
+    ip_str = ''
+    if alignment_result and getattr(alignment_result, 'ip_winner', None):
+        margin_val = getattr(alignment_result, 'ip_vert_margin_mm', None)
+        margin_str = f"{margin_val:+.1f}mm" if margin_val is not None else "N/A"
+        ip_str = (f"  ip={alignment_result.ip_winner}({margin_str})"
+                  f"{'[ARB]' if alignment_result.ip_tiebreak_applied else ''}")
+
     if out['lstv_detected']:
         logger.info(
-            f"  ✓✓ [{study_id}] LSTV DETECTED  "
+            f"  ++ [{study_id}] LSTV DETECTED  "
             f"Castellvi={out.get('castellvi_type','None')}  "
             f"phenotype={morpho_dict.get('lstv_phenotype','?')}  "
             f"P(sac)={probs_dict.get('p_sacralization',0):.0%}  "
@@ -919,16 +1176,18 @@ def classify_study(study_id:       str,
             + (f"alignment={alignment_result.preferred_hypothesis} "
                f"[{alignment_result.confidence}]"
                if alignment_result else "alignment=N/A")
+            + ip_str
         )
     else:
-        logger.info(f"  ✗✗ [{study_id}] No LSTV  "
+        logger.info(f"  -- [{study_id}] No LSTV  "
                     f"P(sac)={probs_dict.get('p_sacralization',0):.0%}  "
-                    f"P(lumb)={probs_dict.get('p_lumbarization',0):.0%}")
+                    f"P(lumb)={probs_dict.get('p_lumbarization',0):.0%}"
+                    + ip_str)
 
     return out, alignment_result
 
 
-# ── H1 ensemble helper ────────────────────────────────────────────────────────
+# ── Ensemble offset helper ────────────────────────────────────────────────────
 
 def _run_ensemble_offset(
         study_id:           str,
@@ -942,40 +1201,11 @@ def _run_ensemble_offset(
         tss_highest_lumbar: Optional[int],
         vert_unique:        List[int],
 ) -> None:
-    """
-    Run Castellvi classification under the alternative offset hypothesis and
-    store the result in AlignmentResult.castellvi_at_best / lstv_detected_at_best.
-
-    TV selection by offset:
-        offset = +1  (lumbarization — VERIDAH has extra caudal segment)
-            "at_best" TV = VERIDAH's most caudal lumbar label.
-            Interpretation: VERIDAH's L6 (or highest VD lumbar label) is the
-            true transitional vertebra.  The transverse process incident on
-            THAT vertebra is used for Castellvi.
-
-        offset = -1  (sacralization — TSS has extra caudal segment)
-            "at_best" TV = VERIDAH label one level cranial to the primary TV.
-            Interpretation: TSS's L5 is actually S1; the true last mobile
-            lumbar is TSS L4 / VERIDAH L4.  The TP incident on that level
-            is used for Castellvi.
-
-        offset = ±2  analogous but two levels, handled generically.
-
-    Both "at_zero" (TSS-guided L5 as TV) and "at_best" (offset-guided TV)
-    classifications are preserved so the CSV can report both and flag
-    disagreement.
-    """
     offset = ar.best_offset
 
-    # ── Determine the "at_best" TV label ──────────────────────────────────────
-    # Primary TV under at_zero is TSS's most caudal lumbar → VD equivalent.
-    # Under the offset hypothesis the TV shifts by `offset` levels in VD space.
-    # VD lumbar labels are VD_LUMBAR_BASE(20) .. VD_LUMBAR_MAX(25).
-    # The at_zero TV is the VD label corresponding to tss_highest_lumbar.
     from vertebral_alignment import VD_LUMBAR_BASE, VD_LUMBAR_MAX
 
-    # Find which VD label the primary classification used (at_zero TV)
-    at_zero_vd = TSS_VERT_TO_VD.get(tss_highest_lumbar)   # e.g. VD_L5 = 24
+    at_zero_vd = TSS_VERT_TO_VD.get(tss_highest_lumbar)
 
     if at_zero_vd is None:
         logger.warning(f"  [{study_id}] Ensemble offset: cannot determine at_zero VD label")
@@ -983,9 +1213,6 @@ def _run_ensemble_offset(
         ar.lstv_detected_at_best = None
         return
 
-    # at_best TV is shifted by `offset` in VD label space
-    # offset=+1 → TV = VD_L6 (one more caudal)
-    # offset=-1 → TV = VD_L4 (one more cranial)
     at_best_vd = at_zero_vd + offset
 
     if not (VD_LUMBAR_BASE <= at_best_vd <= VD_LUMBAR_MAX):
@@ -1008,9 +1235,8 @@ def _run_ensemble_offset(
     logger.info(
         f"  [{study_id}_ens] Ensemble offset={offset:+d}: "
         f"at_zero TV=VD{at_zero_vd}({VERIDAH_NAMES.get(at_zero_vd,'?')}) "
-        f"→ at_best TV=VD{at_best_vd}({at_best_name})")
+        f"-> at_best TV=VD{at_best_vd}({at_best_name})")
 
-    # ── TV Z-range for at_best TV ──────────────────────────────────────────────
     tv_z_best, _ = get_tv_z_range(sag_vert, sag_tss, at_best_vd,
                                    study_id + '_ens')
     if tv_z_best is None:
@@ -1019,11 +1245,9 @@ def _run_ensemble_offset(
         ar.lstv_detected_at_best = None
         return
 
-    # ── Segmental axis for at_best TV ─────────────────────────────────────────
     seg_axis_best, _ = compute_segmental_axis(
         sag_tss, sag_vert, at_best_vd, vox_mm, study_id + '_ens')
 
-    # ── Phase 1 for both sides using at_best TV ────────────────────────────────
     left_best  = phase1_sagittal('left_ens',  SP_TP_L, sag_sp, sag_tss, vox_mm,
                                   tv_z_best, seg_axis_best, 'ens')
     right_best = phase1_sagittal('right_ens', SP_TP_R, sag_sp, sag_tss, vox_mm,
@@ -1038,7 +1262,6 @@ def _run_ensemble_offset(
         f"h={right_best['tp_height_mm']:.1f}mm  d={right_best['dist_mm']:.1f}mm  "
         f"z=[{right_best.get('tp_z_min_vox','?')},{right_best.get('tp_z_max_vox','?')}]")
 
-    # ── Phase 1+2 → Castellvi ─────────────────────────────────────────────────
     conf_ref = ['high']
     ct_best, left_best, right_best = finalise_castellvi(
         left_best, right_best, p2_available,
@@ -1051,16 +1274,15 @@ def _run_ensemble_offset(
         f"  [{study_id}_ens] Ensemble Castellvi offset={offset:+d}: "
         f"{ct_best or 'None'}  (TV={at_best_name}, tv_z={tv_z_best})")
 
-    # ── Flag disagreement ──────────────────────────────────────────────────────
     if ar.castellvi_at_zero != ar.castellvi_at_best:
         logger.info(
-            f"  [{study_id}_ens] ⚠ CASTELLVI DISAGREES: "
+            f"  [{study_id}_ens] CASTELLVI DISAGREES: "
             f"at_zero={ar.castellvi_at_zero or 'None'} "
             f"vs at_best(offset={offset:+d})={ct_best or 'None'}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STUDY SELECTION  (identical to v4.1)
+# STUDY SELECTION
 # ══════════════════════════════════════════════════════════════════════════════
 
 def select_studies_csv(csv_path, top_n, rank_by, valid_ids):
@@ -1082,7 +1304,7 @@ def select_studies_csv(csv_path, top_n, rank_by, valid_ids):
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description='Hybrid Two-Phase LSTV Castellvi Classifier v4.2 (Alignment Ensemble)',
+        description='Hybrid Two-Phase LSTV Castellvi Classifier v4.4 (Ian Pan Vertebral Arbitration)',
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--spineps_dir',      required=True)
     parser.add_argument('--totalspine_dir',   required=True)
@@ -1096,6 +1318,9 @@ def main() -> int:
     parser.add_argument('--top_n',            type=int, default=None)
     parser.add_argument('--rank_by',          default='l5_s1_confidence')
     parser.add_argument('--no_morpho',        action='store_true')
+    parser.add_argument('--ian_pan_coords',   default=None,
+                        help='Path to ian_pan_disc_coords.json.  When offset != 0 Ian Pan '
+                             'vertebral body positions arbitrate between TSS and VERIDAH.')
     args = parser.parse_args()
 
     spineps_dir    = Path(args.spineps_dir)
@@ -1105,6 +1330,20 @@ def main() -> int:
     output_dir     = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     seg_root = spineps_dir / 'segmentations'
+
+    IAN_PAN: Dict[str, dict] = {}
+    if args.ian_pan_coords:
+        ip_path = Path(args.ian_pan_coords)
+        if not ip_path.exists():
+            logger.warning(f"--ian_pan_coords file not found: {ip_path}")
+        elif not _IAN_PAN_AVAILABLE:
+            logger.warning("ian_pan_disc_coords module not importable — arbitration disabled")
+        else:
+            try:
+                IAN_PAN = load_ian_pan_disc_coords(ip_path)
+                logger.info(f"Ian Pan disc coords loaded: {len(IAN_PAN)} studies")
+            except Exception as exc:
+                logger.error(f"Failed to load Ian Pan coords: {exc}")
 
     if args.study_id:
         study_ids = [args.study_id]
@@ -1119,7 +1358,9 @@ def main() -> int:
                                         args.rank_by, valid)
         study_ids = [s for s in study_ids if (seg_root / s).is_dir()]
 
-    logger.info(f"Processing {len(study_ids)} studies")
+    logger.info(f"Processing {len(study_ids)} studies"
+                + (f"  [Ian Pan arbitration: {len(IAN_PAN)} studies loaded]"
+                   if IAN_PAN else "  [Ian Pan arbitration: disabled]"))
 
     results:           List[dict]            = []
     alignment_results: List[AlignmentResult] = []
@@ -1130,17 +1371,19 @@ def main() -> int:
     phenotype_counts:  Dict[str, int] = {}
     axis_deviations:   List[float]    = []
 
-    # ── Alignment frequency tracking ──────────────────────────────────────────
     n_h0 = n_h1 = n_insuf = n_l6 = 0
     n_l6_confirmed = n_l6_rejected = 0
     n_classification_changed = 0
+    n_ip_arbitrated = 0
 
     for sid in study_ids:
         logger.info(f"\n{'='*60}\n[{sid}]")
         try:
             r, ar = classify_study(
                 sid, spineps_dir, totalspine_dir, registered_dir, nifti_dir,
-                run_morpho=not args.no_morpho)
+                run_morpho=not args.no_morpho,
+                ian_pan_study=IAN_PAN.get(sid),
+            )
             results.append(r)
             if ar is not None:
                 alignment_results.append(ar)
@@ -1161,29 +1404,28 @@ def main() -> int:
                 if deg is not None:
                     axis_deviations.append(float(deg))
 
-            # ── Alignment frequency ────────────────────────────────────────────
             if ar is not None:
-                if   ar.preferred_hypothesis == 'aligned':      n_h0   += 1
-                elif ar.preferred_hypothesis == 'shifted_plus_1':       n_h1   += 1
+                if   ar.preferred_hypothesis == 'aligned':           n_h0   += 1
+                elif ar.preferred_hypothesis == 'shifted_plus_1':    n_h1   += 1
                 elif ar.preferred_hypothesis == 'insufficient_data': n_insuf += 1
 
                 if 25 in (ar.vd_labels_present or []):
                     n_l6 += 1
-                    if ar.preferred_hypothesis == 'shifted_plus_1':   n_l6_confirmed += 1
-                    elif ar.preferred_hypothesis == 'aligned': n_l6_rejected  += 1
+                    if ar.preferred_hypothesis == 'shifted_plus_1':  n_l6_confirmed += 1
+                    elif ar.preferred_hypothesis == 'aligned':        n_l6_rejected  += 1
 
                 if (ar.castellvi_at_zero != ar.castellvi_at_best or
                         ar.phenotype_at_zero != ar.phenotype_at_best):
                     n_classification_changed += 1
+
+                if getattr(ar, 'ip_tiebreak_applied', False):
+                    n_ip_arbitrated += 1
 
         except Exception as exc:
             logger.error(f"  Unhandled: {exc}")
             logger.debug(traceback.format_exc())
             errors += 1
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # COHORT STATISTICS
-    # ══════════════════════════════════════════════════════════════════════════
     cohort_stats: Optional[CohortAlignmentStats] = None
     if alignment_results:
         cohort_stats = compute_cohort_stats(alignment_results)
@@ -1215,7 +1457,7 @@ def main() -> int:
 
     sep = '=' * 70
     logger.info(f"\n{sep}")
-    logger.info(f"{'LSTV DETECTION SUMMARY  (v4.2 — ALIGNMENT ENSEMBLE)':^70}")
+    logger.info(f"{'LSTV DETECTION SUMMARY  (v4.4 — IAN PAN VERTEBRAL ARBITRATION)':^70}")
     logger.info(f"{sep}")
     logger.info(f"Studies processed:             {len(results)}")
     logger.info(f"LSTV detected:                 {lstv_n}  ({100*lstv_n/n:.1f}%)")
@@ -1225,65 +1467,70 @@ def main() -> int:
     logger.info(f"  Normal:                      {phenotype_counts.get('normal',0)}")
     logger.info(f"Errors:                        {errors}")
 
-    logger.info(f"\n── VERTEBRAL ALIGNMENT ANALYSIS ──────────────────────────────────")
+    logger.info(f"\n-- VERTEBRAL ALIGNMENT ANALYSIS --")
     n_align = len(alignment_results)
     logger.info(f"  Studies with alignment data: {n_align}")
     logger.info(f"  H0 (aligned, TSS=GT):        {n_h0}  ({100*n_h0/max(n_align,1):.1f}%)")
     logger.info(f"  H1 (shifted, SPINEPS=GT):    {n_h1}  ({100*n_h1/max(n_align,1):.1f}%)")
     logger.info(f"  Insufficient data:           {n_insuf}  ({100*n_insuf/max(n_align,1):.1f}%)")
-    logger.info(f"")
     logger.info(f"  Studies with VERIDAH L6:     {n_l6}  ({100*n_l6/max(n_align,1):.1f}%)")
     if n_l6 > 0:
-        logger.info(f"    L6 → confirmed off-by-one: {n_l6_confirmed}  "
-                    f"({100*n_l6_confirmed/n_l6:.1f}% of L6 studies)")
-        logger.info(f"    L6 → H0 retained (FP L6):  {n_l6_rejected}  "
-                    f"({100*n_l6_rejected/n_l6:.1f}% of L6 studies)")
-        logger.info(f"    L6 false-positive rate:    {100*n_l6_rejected/n_l6:.1f}%")
-    logger.info(f"")
-    logger.info(f"  Classification changes H0→H1: {n_classification_changed}  "
-                f"({100*n_classification_changed/max(n_align,1):.1f}%)")
+        logger.info(f"    L6 confirmed off-by-one:   {n_l6_confirmed}  ({100*n_l6_confirmed/n_l6:.1f}%)")
+        logger.info(f"    L6 H0 retained (FP):       {n_l6_rejected}  ({100*n_l6_rejected/n_l6:.1f}%)")
+    logger.info(f"  Classification changes:      {n_classification_changed}  ({100*n_classification_changed/max(n_align,1):.1f}%)")
+
+    logger.info(f"\n-- IAN PAN VERTEBRAL ARBITRATION --")
+    if IAN_PAN:
+        n_ip_matched  = sum(1 for ar in alignment_results if getattr(ar, 'ip_winner', None) is not None)
+        n_ip_tss      = sum(1 for ar in alignment_results if getattr(ar, 'ip_winner', None) == 'TSS')
+        n_ip_vd       = sum(1 for ar in alignment_results if getattr(ar, 'ip_winner', None) == 'VERIDAH')
+        n_ip_tie      = sum(1 for ar in alignment_results if getattr(ar, 'ip_winner', None) == 'tie')
+        n_ip_insuf    = sum(1 for ar in alignment_results if getattr(ar, 'ip_winner', None) == 'insufficient')
+        n_ip_eligible = sum(1 for ar in alignment_results if (getattr(ar, 'best_offset', 0) or 0) != 0)
+        logger.info(f"  Ian Pan studies matched:       {n_ip_matched} / {n_align}")
+        logger.info(f"  Studies eligible (offset!=0):  {n_ip_eligible}")
+        logger.info(f"  IP winner = TSS (aligned):     {n_ip_tss}")
+        logger.info(f"  IP winner = VERIDAH (shifted): {n_ip_vd}")
+        logger.info(f"  IP winner = tie (ambiguous):   {n_ip_tie}")
+        logger.info(f"  IP winner = insufficient:      {n_ip_insuf}")
+        logger.info(f"  Arbitrations applied:          {n_ip_arbitrated}")
+        margins = [getattr(ar, 'ip_vert_margin_mm', None) for ar in alignment_results
+                   if getattr(ar, 'ip_vert_margin_mm', None) is not None]
+        if margins:
+            logger.info(f"  Mean vert margin (VD-TSS):     {np.mean(margins):+.1f}mm (+ve = TSS closer)")
+    else:
+        logger.info(f"  Ian Pan arbitration:           DISABLED")
 
     if cohort_stats:
-        logger.info(f"  Mean best alignment score:   "
-                    f"{cohort_stats.mean_best_score:.3f} ± {cohort_stats.std_best_score:.3f}"
-                    if cohort_stats.mean_best_score else "  Mean best alignment score:   N/A")
+        logger.info(f"\n-- Alignment Confidence --")
+        logger.info(f"  High: {cohort_stats.n_high}  Moderate: {cohort_stats.n_moderate}  "
+                    f"Low: {cohort_stats.n_low}  Insufficient: {cohort_stats.n_insufficient}")
 
-    logger.info(f"\n── Alignment Confidence Breakdown ────────────────────────────────")
-    if cohort_stats:
-        logger.info(f"  High:          {cohort_stats.n_high}")
-        logger.info(f"  Moderate:      {cohort_stats.n_moderate}")
-        logger.info(f"  Low:           {cohort_stats.n_low}")
-        logger.info(f"  Insufficient:  {cohort_stats.n_insufficient}")
-
-    logger.info(f"\n── Castellvi Type Breakdown ──────────────────────────────────────")
+    logger.info(f"\n-- Castellvi Type Breakdown --")
     for t, cnt in castellvi_counts.items():
         if cnt: logger.info(f"  {t:12s}: {cnt}")
     total_ct = sum(castellvi_counts.values())
     logger.info(f"  {'TOTAL':12s}: {total_ct}  ({100*total_ct/n:.1f}%)")
 
     if axis_deviations:
-        logger.info(f"\n── Segmental Axis QA ─────────────────────────────────────────────")
-        logger.info(f"  mean={np.mean(axis_deviations):.1f}°  "
-                    f"median={np.median(axis_deviations):.1f}°  "
-                    f"max={np.max(axis_deviations):.1f}°  n={len(axis_deviations)}")
+        logger.info(f"\n-- Segmental Axis QA --")
+        logger.info(f"  mean={np.mean(axis_deviations):.1f}  median={np.median(axis_deviations):.1f}  "
+                    f"max={np.max(axis_deviations):.1f} deg  n={len(axis_deviations)}")
         n_dev = sum(1 for d in axis_deviations if d > 20.)
-        logger.info(f"  TPs deviating >20°: {n_dev} ({100*n_dev/len(axis_deviations):.1f}%)")
+        logger.info(f"  TPs deviating >20 deg: {n_dev} ({100*n_dev/len(axis_deviations):.1f}%)")
 
-    logger.info(f"\n── Probability Model Statistics ──────────────────────────────────")
+    logger.info(f"\n-- Probability Model Statistics --")
     if p_sac_vals:
         logger.info(f"  P(sacralization):  mean={np.mean(p_sac_vals):.2%}  >80%: {high_cert_sac}")
         logger.info(f"  P(lumbarization):  mean={np.mean(p_lumb_vals):.2%}  >80%: {high_cert_lumb}")
-        logger.info(f"  Disc ratio <0.65:  {rel_disc_low}")
 
-    logger.info(f"\n── Surgical Risk Distribution ────────────────────────────────────")
+    logger.info(f"\n-- Surgical Risk Distribution --")
     for risk_lvl in ('critical', 'high', 'moderate', 'low-moderate', 'low'):
         cnt = wl_risk_counts.get(risk_lvl, 0)
         if cnt: logger.info(f"  {risk_lvl:14s}: {cnt}")
-    logger.info(f"  Bertolotti P≥50%:  {bertolotti_ge50}")
-
+    logger.info(f"  Bertolotti P>=50%: {bertolotti_ge50}")
     logger.info(f"\n{sep}")
 
-    # ── JSON outputs ───────────────────────────────────────────────────────────
     out_json = output_dir / 'lstv_results.json'
     with open(out_json, 'w') as fh:
         json.dump(results, fh, indent=2, default=str)
@@ -1306,6 +1553,16 @@ def main() -> int:
             'n_classification_changed':    n_classification_changed,
             'cohort_stats': cohort_stats.to_dict() if cohort_stats else None,
         },
+        'ian_pan_summary': {
+            'arbitration_enabled':    bool(IAN_PAN),
+            'n_studies_with_data':    sum(1 for ar in alignment_results
+                                         if getattr(ar, 'ip_winner', None) is not None),
+            'n_arbitrations_applied': n_ip_arbitrated,
+            'n_winner_tss':           sum(1 for ar in alignment_results
+                                         if getattr(ar, 'ip_winner', None) == 'TSS'),
+            'n_winner_veridah':       sum(1 for ar in alignment_results
+                                         if getattr(ar, 'ip_winner', None) == 'VERIDAH'),
+        },
         'probability_stats': {
             'mean_p_sacralization': round(float(np.mean(p_sac_vals)),4) if p_sac_vals else None,
             'mean_p_lumbarization': round(float(np.mean(p_lumb_vals)),4) if p_lumb_vals else None,
@@ -1319,7 +1576,6 @@ def main() -> int:
     with open(output_dir / 'lstv_summary.json', 'w') as fh:
         json.dump(summary, fh, indent=2, default=str)
 
-    # ── CSV outputs ────────────────────────────────────────────────────────────
     if cohort_stats is not None:
         try:
             write_csv_reports(results, alignment_results, cohort_stats, output_dir)
@@ -1327,9 +1583,8 @@ def main() -> int:
             logger.error(f"CSV reporting failed: {exc}")
             logger.debug(traceback.format_exc())
 
-    logger.info(f"Results → {out_json}")
-    logger.info(f"CSV     → {output_dir}/lstv_per_study.csv  "
-                f"lstv_alignment.csv  lstv_cohort_summary.csv")
+    logger.info(f"Results -> {out_json}")
+    logger.info(f"CSV     -> {output_dir}/lstv_per_study.csv  lstv_alignment.csv  lstv_cohort_summary.csv")
     return 0
 
 

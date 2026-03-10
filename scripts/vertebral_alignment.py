@@ -149,6 +149,11 @@ class AlignmentResult:
     ground_truth_label:
         Reserved for prospective annotation via axial nerve morphology,
         iliolumbar ligament, or full-spine CT.
+
+    ip_* fields:
+        Populated externally by apply_ian_pan_tiebreaker() in 04_detect_lstv.py.
+        Provide Ian Pan disc sequence vote data and record whether a tiebreak
+        was applied.  All fields are None until the tiebreaker runs.
     """
     study_id:              str
     best_offset:           Optional[int]
@@ -182,8 +187,26 @@ class AlignmentResult:
 
     summary:               str = ''
 
+    # ── Ian Pan disc sequence integration ─────────────────────────────────────
+    # Populated by apply_ian_pan_tiebreaker() in 04_detect_lstv.py.
+    # All fields remain None if Ian Pan coords are not provided.
+    ip_sequence_vote:    Optional[str]   = None  # 'H0' | 'H1' | 'neutral'
+    ip_vote_confidence:  Optional[str]   = None  # 'high' | 'moderate' | 'low' | 'insufficient'
+    ip_seq_margin_mm:    Optional[float] = None  # mean_dist_h0 - mean_dist_h1 (mm)
+    ip_mean_dist_h0_mm:  Optional[float] = None  # mean distance across levels under H0
+    ip_mean_dist_h1_mm:  Optional[float] = None  # mean distance across levels under H1
+    ip_n_levels_voted:   Optional[int]   = None  # disc levels that contributed to vote
+    ip_tiebreak_applied: bool            = False  # True if Ian Pan changed preferred_hypothesis
+    ip_per_level:        Optional[dict]  = None  # per-disc detail dict (all 5 levels)
+
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        # Ian Pan fields are included automatically via asdict() since they are
+        # proper dataclass fields; listed here explicitly for documentation.
+        # 'ip_sequence_vote', 'ip_vote_confidence', 'ip_seq_margin_mm',
+        # 'ip_mean_dist_h0_mm', 'ip_mean_dist_h1_mm',
+        # 'ip_n_levels_voted', 'ip_tiebreak_applied', 'ip_per_level'
+        return d
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
