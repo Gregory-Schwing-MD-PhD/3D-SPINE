@@ -30,6 +30,8 @@ nvidia-smi
 export SINGULARITY_TMPDIR="/tmp/${USER}_job_${SLURM_JOB_ID}"
 export XDG_RUNTIME_DIR="$SINGULARITY_TMPDIR/runtime"
 export NXF_SINGULARITY_CACHEDIR="${HOME}/singularity_cache"
+# Point Singularity's OWN cache at the same dir (NXF_* is only read by Nextflow)
+export SINGULARITY_CACHEDIR="${NXF_SINGULARITY_CACHEDIR}"
 mkdir -p "$SINGULARITY_TMPDIR" "$XDG_RUNTIME_DIR" "$NXF_SINGULARITY_CACHEDIR"
 trap 'rm -rf "$SINGULARITY_TMPDIR"' EXIT
 
@@ -74,7 +76,18 @@ CONTAINER="docker://go2432/lstv-uncertainty:latest"
 IMG_PATH="${NXF_SINGULARITY_CACHEDIR}/lstv-uncertainty.sif"
 if [[ ! -f "$IMG_PATH" ]]; then
     echo "Pulling container..."
-    singularity pull "$IMG_PATH" "$CONTAINER"
+    TMP_SIF="${IMG_PATH}.tmp.${SLURM_JOB_ID}"
+    rm -f "$TMP_SIF"
+    # Pull to a temp path so a failed/partial pull never leaves a corrupt .sif.
+    # On a stale-cache descriptor error, wipe the cache and retry once.
+    if ! singularity pull "$TMP_SIF" "$CONTAINER"; then
+        echo "Pull failed; cleaning Singularity cache and retrying once..."
+        singularity cache clean -f || true
+        rm -rf "${SINGULARITY_CACHEDIR}"/{cache,oci-tmp,oci-blob,blob,library,net,oras,shub} 2>/dev/null || true
+        rm -f "$TMP_SIF"
+        singularity pull "$TMP_SIF" "$CONTAINER"
+    fi
+    mv -f "$TMP_SIF" "$IMG_PATH"
 fi
 echo "Container ready: $IMG_PATH"
 
