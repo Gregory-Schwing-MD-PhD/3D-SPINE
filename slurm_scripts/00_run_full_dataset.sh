@@ -75,7 +75,23 @@ if [[ ! -f "models/point_net_checkpoint.pth" ]]; then
     exit 1
 fi
 
-N_VALID=$(python3 -c "import numpy as np; a=np.load('models/valid_id.npy'); print(len(a))")
+# Count valid IDs without depending on numpy (the orchestrator runs in the
+# `nextflow` conda env, which has no numpy — the real work runs in containers).
+# Parse the .npy header directly; fall back to "?" so this can never abort the
+# job under `set -euo pipefail`. N_VALID is informational only (echoed below).
+N_VALID=$(python3 -c "
+import ast, struct, sys
+try:
+    with open('models/valid_id.npy', 'rb') as f:
+        assert f.read(6) == b'\x93NUMPY', 'not a .npy file'
+        major = f.read(2)[0]
+        hlen = struct.unpack('<I' if major >= 2 else '<H', f.read(4 if major >= 2 else 2))[0]
+        hdr = ast.literal_eval(f.read(hlen).decode('latin1'))
+        print(hdr['shape'][0])
+except Exception as e:
+    sys.stderr.write('WARN: could not count valid_id.npy (%s)\n' % e)
+    print('?')
+" 2>>logs/lstv_full_dataset_${SLURM_JOB_ID}.err || echo "?")
 echo "Valid study IDs: $N_VALID"
 echo ""
 echo "Pipeline will submit:"
