@@ -41,6 +41,7 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -56,6 +57,22 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# stderr signatures that mean the container env itself is wrecked (OOM / shm
+# exhaustion / killed worker) rather than this one study having bad data. When
+# we see these, every subsequent study fails instantly with the same message,
+# so we abort the whole run instead of churning through and mislabeling them.
+FATAL_ENV_MARKERS = (
+    'Intel MKL FATAL ERROR',
+    'BrokenProcessPool',
+    'Cannot allocate memory',
+    'std::bad_alloc',
+)
+
+
+class FatalEnvironmentError(RuntimeError):
+    """Raised when TotalSpineSeg fails in a way that poisons the whole run."""
+
 
 SAGITTAL_T2_PATTERNS = [
     'Sagittal T2/STIR',
@@ -180,6 +197,16 @@ def run_totalspineseg(nifti_path: Path, study_output_dir: Path,
             '--save-uncertainties',
         ]
 
+        # Cap the worker pool. TotalSpineSeg defaults to os.cpu_count() (the
+        # whole node), which oversubscribes RAM under SLURM and triggers
+        # OOM -> BrokenProcessPool -> MKL crash. TSS_MAX_WORKERS is set by the
+        # slurm script to the allocated CPU count.
+        max_workers = os.environ.get('TSS_MAX_WORKERS')
+        if max_workers and max_workers.isdigit() and int(max_workers) > 0:
+            n = int(max_workers)
+            cmd += ['--max-workers', str(n),
+                    '--max-workers-nnunet', str(min(n, 4))]
+
         logger.info(f"  Running TotalSpineSeg ({acq}, full inference)...")
         sys.stdout.flush()
 
@@ -193,7 +220,10 @@ def run_totalspineseg(nifti_path: Path, study_output_dir: Path,
         sys.stdout.flush()
 
         if result.returncode != 0:
-            logger.error(f"  TotalSpineSeg failed:\n{result.stderr[-2000:]}")
+            stderr = result.stderr or ''
+            logger.error(f"  TotalSpineSeg failed:\n{stderr[-2000:]}")
+            if any(marker in stderr for marker in FATAL_ENV_MARKERS):
+                raise FatalEnvironmentError(stderr[-500:])
             return None
 
         step2_output_dir = temp_output / 'step2_output'
@@ -424,6 +454,7 @@ def main():
 
     success_count = 0
     error_count   = 0
+    aborted       = False
 
     for study_id in tqdm(ordered_to_run, desc='TotalSpineSeg'):
         logger.info(f"\n[{study_id}]")
@@ -479,6 +510,20 @@ def main():
             logger.warning("\nInterrupted — progress saved")
             save_progress(progress_file, progress)
             break
+        except FatalEnvironmentError:
+            logger.error("\n" + "=" * 70)
+            logger.error("FATAL: container environment corrupted (Intel MKL / BrokenProcessPool).")
+            logger.error("This is almost always host-RAM or /dev/shm exhaustion from too many")
+            logger.error("TotalSpineSeg workers. Aborting now so the remaining studies are NOT")
+            logger.error("marked failed in a dead environment.")
+            logger.error("Resubmit the job — already-done studies are skipped and failed are")
+            logger.error("retried first. Ensure TSS_MAX_WORKERS is set (see slurm script).")
+            logger.error("=" * 70)
+            mark_failed(progress, study_id)
+            save_progress(progress_file, progress)
+            error_count += 1
+            aborted = True
+            break
         except Exception as e:
             logger.error(f"  Unexpected: {e}")
             logger.debug(traceback.format_exc())
@@ -493,6 +538,9 @@ def main():
     logger.info(f"Already done: {len(skip_already_done)}")
     if progress.get('failed'):
         logger.info(f"Failed IDs:   {progress['failed']}")
+    if aborted:
+        logger.info("Status:       ABORTED (environment crash) — resubmit to continue")
+        return 2
     return 0 if error_count == 0 else 1
 
 

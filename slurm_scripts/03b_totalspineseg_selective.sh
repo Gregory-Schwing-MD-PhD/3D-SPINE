@@ -3,7 +3,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=64G
+#SBATCH --mem=96G
 #SBATCH --gres=gpu:1
 #SBATCH --time=36:00:00
 #SBATCH --job-name=totalspineseg_selective
@@ -40,6 +40,17 @@ export NXF_SINGULARITY_CACHEDIR="${HOME}/singularity_cache"
 mkdir -p "$XDG_RUNTIME_DIR" "$NXF_SINGULARITY_CACHEDIR"
 
 unset LD_LIBRARY_PATH PYTHONPATH R_LIBS R_LIBS_USER R_LIBS_SITE
+
+# --- Resource limits (prevent OOM -> BrokenProcessPool -> Intel MKL crash) ---
+# TotalSpineSeg's worker pool defaults to os.cpu_count() (the whole node), which
+# oversubscribes the RAM SLURM actually granted us. Pin every thread/worker
+# count to the allocated CPU count instead.
+N_CPUS="${SLURM_CPUS_PER_TASK:-4}"
+export OMP_NUM_THREADS="$N_CPUS"
+export MKL_NUM_THREADS="$N_CPUS"
+export OPENBLAS_NUM_THREADS="$N_CPUS"
+export TSS_MAX_WORKERS="$N_CPUS"     # read by 03b_totalspineseg_selective.py
+echo "Resource caps: CPUS=$N_CPUS  MEM=96G  TSS_MAX_WORKERS=$N_CPUS"
 
 # --- Paths ---
 PROJECT_DIR="$(pwd)"
@@ -117,6 +128,10 @@ singularity exec --nv \
     --bind "${NNUNET_TRAINER_DIR}":/opt/conda/lib/python3.10/site-packages/nnunetv2/training/nnUNetTrainer \
     --env TOTALSPINESEG_DATA=/app/totalspineseg_models \
     --env PYTHONUNBUFFERED=1 \
+    --env OMP_NUM_THREADS="$OMP_NUM_THREADS" \
+    --env MKL_NUM_THREADS="$MKL_NUM_THREADS" \
+    --env OPENBLAS_NUM_THREADS="$OPENBLAS_NUM_THREADS" \
+    --env TSS_MAX_WORKERS="$TSS_MAX_WORKERS" \
     --pwd /work \
     "$IMG_PATH" \
     python3 -u /work/scripts/03b_totalspineseg_selective.py "${PYTHON_ARGS[@]}"
