@@ -19,6 +19,15 @@ set -euo pipefail
 MODE=all                   # "all" or "selective"
 TOP_N=30                   # used only when MODE=selective
 RANK_BY=l5_s1_confidence   # used only when MODE=selective
+
+# Process at most this many studies per job, then auto-resubmit a FRESH job.
+# Bounds process lifetime so the slow resource leak that causes the recurring
+# "Intel MKL FATAL ERROR: Cannot load <mkl-loader>" crash (~130 studies in)
+# can never accumulate. Keep comfortably below that threshold.
+MAX_STUDIES=${MAX_STUDIES:-75}
+# Safety stop for the auto-resubmit chain (prevents a runaway sbatch loop).
+MAX_CHAIN=${MAX_CHAIN:-20}
+CHAIN_COUNT=${CHAIN_COUNT:-1}
 # ─────────────────────────────────────────────────────────────────────────────
 
 echo "================================================================"
@@ -105,6 +114,7 @@ if [[ "$MODE" == "all" ]]; then
         --series_csv  /work/data/raw/train_series_descriptions.csv
         --valid_ids   /app/models/valid_id.npy
         --all
+        --max_studies "$MAX_STUDIES"
     )
 else
     PYTHON_ARGS=(
@@ -115,10 +125,14 @@ else
         --valid_ids       /app/models/valid_id.npy
         --top_n           "$TOP_N"
         --rank_by         "$RANK_BY"
+        --max_studies     "$MAX_STUDIES"
     )
 fi
 
-# --- Run ---
+echo "Batch chain: run $CHAIN_COUNT/$MAX_CHAIN  |  MAX_STUDIES=$MAX_STUDIES per job"
+
+# --- Run (don't let a nonzero exit abort the script — we handle it below) ---
+set +e
 singularity exec --nv \
     --bind "${PROJECT_DIR}":/work \
     --bind "${NIFTI_DIR}":/work/results/nifti \
@@ -135,8 +149,30 @@ singularity exec --nv \
     --pwd /work \
     "$IMG_PATH" \
     python3 -u /work/scripts/03b_totalspineseg_selective.py "${PYTHON_ARGS[@]}"
+RC=$?
+set -e
 
 echo "================================================================"
-echo "TotalSpineSeg complete | End: $(date)"
-echo "Already-done studies are skipped automatically."
+echo "TotalSpineSeg run complete | exit=$RC | End: $(date)"
 echo "================================================================"
+
+# Exit codes from the orchestrator:
+#   0 = all done   1 = some studies failed (no more to attempt)
+#   2 = aborted on environment crash (more remain)
+#   3 = batch limit reached (more remain)
+# In cases 2 and 3 a FRESH process clears the leaked resources, so auto-resubmit.
+if [[ "$RC" == "2" || "$RC" == "3" ]]; then
+    if [[ "$CHAIN_COUNT" -lt "$MAX_CHAIN" ]]; then
+        NEXT=$((CHAIN_COUNT + 1))
+        echo "More studies remain (rc=$RC). Auto-resubmitting fresh job ($NEXT/$MAX_CHAIN)..."
+        sbatch --export=ALL,CHAIN_COUNT=$NEXT,MAX_STUDIES=$MAX_STUDIES,MAX_CHAIN=$MAX_CHAIN \
+               "${PROJECT_DIR}/slurm_scripts/03b_totalspineseg_selective.sh"
+    else
+        echo "Reached MAX_CHAIN=$MAX_CHAIN — stopping auto-resubmit. Re-run manually if studies remain."
+    fi
+    # Treat a planned continuation as success so SLURM doesn't email this as FAIL.
+    exit 0
+fi
+
+echo "Already-done studies are skipped automatically."
+exit "$RC"

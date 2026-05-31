@@ -284,6 +284,8 @@ def run_totalspineseg(nifti_path: Path, study_output_dir: Path,
     except subprocess.TimeoutExpired:
         logger.error("  TotalSpineSeg timed out (>15 min)")
         return None
+    except FatalEnvironmentError:
+        raise  # must escape to main()'s abort handler, not be swallowed below
     except Exception as e:
         logger.error(f"  Error: {e}")
         logger.debug(traceback.format_exc())
@@ -376,6 +378,11 @@ def main():
     parser.add_argument('--rank_by',         default='l5_s1_confidence')
     parser.add_argument('--all',             action='store_true',
                         help='Process every valid study regardless of uncertainty CSV')
+    parser.add_argument('--max_studies',     type=int, default=None,
+                        help='Process at most this many studies, then exit with code 3 '
+                             '(more remain). Bounds process lifetime so a slow resource '
+                             'leak cannot accumulate into an Intel MKL / fork crash. '
+                             'The slurm wrapper auto-resubmits on exit 3.')
     parser.add_argument('--dry_run',         action='store_true')
     args = parser.parse_args()
 
@@ -447,6 +454,18 @@ def main():
         logger.info("\nAll selected studies already segmented.")
         return 0
 
+    # Bound this process to a batch so a slow resource leak (semaphores / shm /
+    # memory mappings) can't accumulate over hundreds of studies into the
+    # "Intel MKL FATAL ERROR: Cannot load <mkl-loader>" / fork crash. The slurm
+    # wrapper resubmits a fresh process (exit 3) until nothing remains.
+    batch          = ordered_to_run
+    leftover_count = 0
+    if args.max_studies and args.max_studies > 0 and len(ordered_to_run) > args.max_studies:
+        batch          = ordered_to_run[:args.max_studies]
+        leftover_count = len(ordered_to_run) - args.max_studies
+        logger.info(f"Batch limit:      {args.max_studies} this run "
+                    f"({leftover_count} will remain for the next run)")
+
     series_df = load_series_csv(series_csv)
     if series_df is None:
         logger.error("Cannot load series CSV — aborting")
@@ -456,7 +475,7 @@ def main():
     error_count   = 0
     aborted       = False
 
-    for study_id in tqdm(ordered_to_run, desc='TotalSpineSeg'):
+    for study_id in tqdm(batch, desc='TotalSpineSeg'):
         logger.info(f"\n[{study_id}]")
         sys.stdout.flush()
 
@@ -541,6 +560,9 @@ def main():
     if aborted:
         logger.info("Status:       ABORTED (environment crash) — resubmit to continue")
         return 2
+    if leftover_count:
+        logger.info(f"Status:       BATCH DONE — {leftover_count} studies remain, resubmit to continue")
+        return 3
     return 0 if error_count == 0 else 1
 
 
